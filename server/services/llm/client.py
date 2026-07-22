@@ -18,18 +18,22 @@ PROMPT_CACHE_ENABLED = os.getenv("PROMPT_CACHE", "0").lower() in ("1", "true", "
 
 
 def resolve_max_tokens(affection: float = 0, override: Optional[int] = None) -> int:
-    """S-14: dynamic max_tokens by intimacy tier."""
+    """S-14: dynamic max_tokens by intimacy tier.
+
+    Floors raised so early-stage replies can finish a complete thought
+    after answering the user's intent (not telegraph-short).
+    """
     if override is not None:
         return override
-    free_cap = int(os.getenv("MAX_TOKENS_FREE", "256"))
-    paid_cap = int(os.getenv("MAX_TOKENS_PAID", "384"))
+    free_cap = int(os.getenv("MAX_TOKENS_FREE", "480"))
+    paid_cap = int(os.getenv("MAX_TOKENS_PAID", "768"))
     cap = paid_cap
     aff = float(affection or 0)
     if aff < 30:
-        return min(128, cap)
+        return min(int(os.getenv("MAX_TOKENS_AFF_LOW", "384")), cap)
     if aff < 60:
-        return min(256, cap)
-    return cap if cap >= free_cap else free_cap
+        return min(int(os.getenv("MAX_TOKENS_AFF_MID", "512")), cap)
+    return max(cap, free_cap)
 
 
 def _provider_supports_prompt_cache(llm: Any) -> bool:

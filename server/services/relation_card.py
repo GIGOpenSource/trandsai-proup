@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from typing import Any, Dict, List, Optional
 
 from core.database import UserCompanionStateORM, get_db
@@ -86,6 +87,12 @@ def save_card(user_id: int, companion_id: str, card: Dict[str, Any]) -> None:
         else:
             row.relation_card_json = raw
             row.relation_card_version = int(payload.get("version") or 1)
+            # 同步亲密度到列，避免只写 JSON、列表/hydrate 仍读旧微增量
+            if payload.get("affection") is not None:
+                try:
+                    row.affection = float(payload.get("affection") or 0)
+                except (TypeError, ValueError):
+                    pass
 
 
 def merge_facts(card: Dict[str, Any], new_facts: List[str], max_items: int = 10) -> Dict[str, Any]:
@@ -95,6 +102,9 @@ def merge_facts(card: Dict[str, Any], new_facts: List[str], max_items: int = 10)
     for f in new_facts or []:
         s = str(f).strip()
         if not s or s in seen:
+            continue
+        # 丢弃韩文行，避免污染中文关系卡
+        if re.search(r"[\uac00-\ud7af]", s):
             continue
         facts.append(s)
         seen.add(s)

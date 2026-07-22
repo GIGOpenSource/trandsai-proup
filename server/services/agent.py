@@ -36,10 +36,16 @@ def get_llm(
 ):
     """LLM支持. role=respond|inner|archive（C5 外部分级）。"""
     cfg = _get_agent_config()
-    temperature = temperature if temperature is not None else cfg.get("temperature", 0.93)
+    # respond：略随机即可；过高温度 + 强惩罚会破坏表达逻辑
+    default_temp = 0.82 if (role or "respond").lower() == "respond" else 0.5
+    temperature = temperature if temperature is not None else cfg.get("temperature", default_temp)
+    if temperature is None:
+        temperature = default_temp
     max_tokens = max_tokens if max_tokens is not None else cfg.get("max_tokens", 512)
 
     role = (role or "respond").lower()
+    freq_pen = float(os.getenv("LLM_FREQUENCY_PENALTY", "0.12" if role == "respond" else "0") or 0)
+    pres_pen = float(os.getenv("LLM_PRESENCE_PENALTY", "0.08" if role == "respond" else "0") or 0)
     if provider is None:
         if role == "inner":
             provider = os.getenv("INNER_MODEL_PROVIDER") or os.getenv("MODEL_PROVIDER_INNER") or cfg.get("inner_provider")
@@ -73,6 +79,12 @@ def get_llm(
         return os.getenv(env_name, "") or ""
 
 
+    openai_extra = {}
+    if freq_pen:
+        openai_extra["frequency_penalty"] = freq_pen
+    if pres_pen:
+        openai_extra["presence_penalty"] = pres_pen
+
     if provider == "deepseek":
         api_key = _override_or_env("deepseek_key", "DEEPSEEK_API_KEY")
         if not api_key:
@@ -83,6 +95,7 @@ def get_llm(
             max_tokens=max_tokens,
             api_key=api_key,
             base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",  # 百炼固定兼容地址
+            **openai_extra,
         )
 
     if provider in ("grok", "xai"):
@@ -95,6 +108,7 @@ def get_llm(
             max_tokens=max_tokens,
             api_key=api_key,
             base_url="https://api.x.ai/v1",
+            **openai_extra,
         )
 
     if provider == "openai":
@@ -106,6 +120,7 @@ def get_llm(
             temperature=temperature,
             max_tokens=max_tokens,
             api_key=api_key,
+            **openai_extra,
         )
 
     # 기본값은 anthropic
@@ -222,8 +237,16 @@ def think_node(state: AgentState) -> dict:
 
 
 def _calculate_affection_delta(old_affection: float, signal: str = "up") -> float:
-    """REQ-B6: base=0.01/(1+aff/20); up=+base, down=-0.5*base, flat=0."""
-    base = 0.01 / (1 + float(old_affection or 0) / 20)
+    """REQ-B6 信号：up/flat/down；基数按可玩亲密度调高（早期约 0.5–0.7/轮，后期缓降）。
+
+    旧公式 0.01/(1+aff/20) 导致数千轮仍困在「陌生人」短回复档，严重伤害真人感。
+    可用环境变量覆盖：AFFECTION_BASE（默认 0.65）、AFFECTION_TAPER（默认 30）。
+    """
+    base_amt = float(os.getenv("AFFECTION_BASE", "0.65"))
+    taper = float(os.getenv("AFFECTION_TAPER", "30"))
+    if taper <= 0:
+        taper = 30.0
+    base = base_amt / (1 + float(old_affection or 0) / taper)
     sig = (signal or "up").strip().lower()
     if sig == "down":
         return round(-0.5 * base, 4)
@@ -349,7 +372,10 @@ def respond_node(state: AgentState) -> dict:
     thread_hint = ""
     if threads:
         thread_hint = "【续话题债】" + "；".join(str(t)[:40] for t in threads[:3])
-    repeat_hint = anti_repeat_hint(list(state.get("recent_assistant") or []))
+    repeat_hint = anti_repeat_hint(
+        list(state.get("recent_assistant") or []),
+        deny_hooks=list(state.get("deny_hooks") or []),
+    )
 
     # B2：关系卡已在 memory_text 时提示勿复述清单
     memory_block = state.get("memory_text") or ""
@@ -379,13 +405,14 @@ def respond_node(state: AgentState) -> dict:
 
 【威胁】{state.get('threat_level') or 'L0'} | 手段={means_mode}
 {means_hint}
-【留存】离开意图则挽留；结尾须有可回的钩子（换类型，勿用忌用钩子）；勿以纯陈述/告别收尾。
-【情感】按亲密度调节强度，最终落到依赖与续聊；结果向量必须朝向用户。
+【留存】仅当离开意图时温和挽留一次；钩子可选；陈述/短反应收尾均可；忌复读忌用钩子与近几轮同款问句。
+【情感】按亲密度调节强度，像「这个人」而不是通用粘人模板。
+【表达】一句一事、指代清楚、先答后延；口语可短但禁止残句乱跳与同义反复凑字。
 【人设】语气与设定一致；自然融入时间 {current_time}。
 {restriction_text}
 
 以 {state['profile'].get('name', 'Companion')} 身份直接口语回复；只输出正文。
-[Reply shape — REQUIRED] 遵循 system 中括号/分段规则。"""
+[Reply shape] 优先一条；遵循 system 中括号/分段规则；长短随心情，勿凑字。"""
 
     affection = float(state.get("updated_affection", state["state"].get("affection", 0)))
     resp = llm_invoke(
@@ -407,12 +434,26 @@ def respond_node(state: AgentState) -> dict:
 
 
 
+def _fact_lang_from_text(user_input: str, fallback: str = "zh") -> str:
+    """按用户文本脚本选事实语言，避免 UI 语言误标导致韩/日文污染关系卡。"""
+    t = user_input or ""
+    if re.search(r"[\u4e00-\u9fff]", t):
+        return "zh"
+    if re.search(r"[\u3040-\u30ff]", t):
+        return "ja"
+    if re.search(r"[\uac00-\ud7af]", t):
+        return "ko"
+    if re.search(r"[A-Za-z]", t):
+        return "en" if (fallback or "").startswith("en") else (fallback or "en")
+    return fallback or "zh"
+
+
 def extract_facts_node(state: AgentState) -> dict:
     """从对话中提取事实（条件触发）"""
     if not state.get("extract_due", True):
         return {"new_facts": []}
     llm = get_llm(temperature=0.3, role="archive")
-    lang = state.get("language", "zh")
+    lang = _fact_lang_from_text(state.get("user_input") or "", state.get("language", "zh"))
     if lang == "en":
         prompt = f"""Extract key facts about "him" from the following conversation. One fact per line, output only the fact list, no explanations.
 
@@ -486,21 +527,46 @@ Contoh format:
 
 Ekstrak:"""
     else:
-        prompt = f"""从以 대화에서 "그"에 관한 주요 사실을 추출하세요. 한 줄에 하나씩, 사실 목록만 출력하고 설명은 하지 마세요.
+        # zh 及其他：必须用中文抽事实（曾误用韩语模板导致关系卡污染）
+        prompt = f"""从以下对话中提取关于「他」的关键事实。每行一条，只输出事实列表，不要解释。
 
-그가 말함: {state['user_input']}
-너의 답장: {state['final_response']}
+他说：{state['user_input']}
+你回：{state['final_response']}
 
-示例 형식:
-- 그는 샤브샤브를 좋아함
-- 그는 최근 업무 스트레스가 많음
-- 그는 두두라는 고양이를 키움
+示例格式：
+- 他喜欢吃火锅
+- 他最近工作压力很大
+- 他有一只叫豆豆的猫
 
-추출:"""
+要求：事实必须使用与用户相同的语言（当前为简体中文）；不要翻译成外语。
+
+提取："""
     resp = llm_invoke(llm, [HumanMessage(content=prompt)], node="extract_facts")
     text = llm_content_to_str(getattr(resp, "content", ""))
     facts = [line.strip("- • \t") for line in text.splitlines() if line.strip().startswith(("-", "•"))]
+    # 门禁：丢掉与用户文本脚本明显不符的外语事实（防韩/日污染中文卡）
+    facts = _filter_facts_by_user_lang(facts, state.get("user_input") or "", lang)
     return {"new_facts": facts}
+
+
+def _filter_facts_by_user_lang(facts: List[str], user_input: str, lang: str) -> List[str]:
+    out: List[str] = []
+    for f in facts or []:
+        s = str(f).strip()
+        if not s:
+            continue
+        has_ko = bool(re.search(r"[\uac00-\ud7af]", s))
+        has_ja = bool(re.search(r"[\u3040-\u30ff]", s))
+        has_zh = bool(re.search(r"[\u4e00-\u9fff]", s))
+        if lang == "zh" and (has_ko or (has_ja and not has_zh)):
+            continue
+        if lang == "en" and (has_ko or has_ja) and not re.search(r"[A-Za-z]", s):
+            continue
+        ui = user_input or ""
+        if re.search(r"[\u4e00-\u9fff]", ui) and has_ko:
+            continue
+        out.append(s)
+    return out
 
 
 def summary_node(state: AgentState) -> dict:
@@ -934,7 +1000,7 @@ def inner_node(state: AgentState) -> dict:
 策略: <人设化手段标签>
 人设依据: <一句；extreme 时可写破例因为…>
 反思: <一句话内心>
-创意: <1～2个留存钩子候选，换类型，勿重复忌用>"""
+创意: <可选 0～1 个钩子候选；多数轮次写「无」；勿重复忌用>"""
 
     text = ""
     try:

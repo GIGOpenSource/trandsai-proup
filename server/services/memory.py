@@ -659,61 +659,91 @@ class CompanionMemory:
             max_facts = 3
             max_turns = 8
             episode_limit = 2
+            dialogue_reserve = min(400, max_chars // 2)
         else:
-            max_chars = min(max_chars, 1800) if max_chars > 2000 else max_chars
-            max_facts = 5
-            max_turns = 12
-            episode_limit = 3
+            # 理解优先：给近聊留足预算，避免关系卡挤掉指代上下文
+            full_cap = int(os.getenv("MEMORY_FULL_MAX_CHARS", "3200"))
+            max_chars = min(max_chars, full_cap) if max_chars > 2000 else max_chars
+            if max_chars < 2200:
+                max_chars = min(full_cap, max(max_chars, 2800))
+            max_facts = 6
+            max_turns = 14
+            episode_limit = 4
+            dialogue_reserve = int(os.getenv("MEMORY_DIALOGUE_RESERVE", "1200"))
 
         if relation_card_text:
-            max_turns = min(max_turns, 8)
+            max_turns = min(max_turns, 12)
             if truncate_episodes:
-                episode_limit = min(episode_limit, 1)
+                episode_limit = min(episode_limit, 3)
 
         need_vector = bool(query) and (
-            len(query) > 20
-            or any(k in query for k in ("记得", "以前", "那次", "还记得", "remember", "before"))
+            len(query) > 6
+            or any(
+                k in query
+                for k in (
+                    "记得",
+                    "以前",
+                    "那次",
+                    "还记得",
+                    "上次",
+                    "那天",
+                    "那个",
+                    "他说",
+                    "她说",
+                    "刚才",
+                    "remember",
+                    "before",
+                    "last time",
+                    "that",
+                )
+            )
         )
-        if relation_card_text and truncate_episodes:
-            need_vector = False
+        # 有关系卡时仍允许语义检索；勿因 truncate_episodes 直接关闭往事
 
         ctx = self.get_context(query if need_vector else "", user_id=user_id)
         short = ctx.pop("_short_term", self.short_term)
-        parts = []
+        other_parts = []
 
         if relation_card_text:
-            parts.append(("【关系卡】\n" + relation_card_text.strip(), 110))
+            # 关系卡可截断；近聊优先
+            card = relation_card_text.strip()
+            card_cap = int(os.getenv("RELATION_CARD_PROMPT_CHARS", "700"))
+            if len(card) > card_cap:
+                card = card[: card_cap - 1] + "…"
+            other_parts.append(("【关系卡】\n" + card, 85))
 
         if ctx["summary"] and not relation_card_text:
-            parts.append(("【关系摘要】\n" + ctx["summary"], 100))
+            other_parts.append(("【关系摘要】\n" + ctx["summary"], 100))
 
         facts = ctx["facts"]
-        if facts and not relation_card_text:
+        if facts:
             seen = set()
             unique_facts = []
+            fact_cap = max_facts if not relation_card_text else min(max_facts, 4)
             for f in reversed(facts):
                 f_norm = f.strip()
                 if f_norm and f_norm not in seen:
                     seen.add(f_norm)
                     unique_facts.append(f_norm)
-                    if len(unique_facts) >= max_facts:
+                    if len(unique_facts) >= fact_cap:
                         break
             unique_facts.reverse()
             if unique_facts:
                 facts_text = "【关于他的已知事实】\n" + "\n".join(f"- {f}" for f in unique_facts)
-                parts.append((facts_text, 80))
+                other_parts.append((facts_text, 80))
 
         episodes = ctx["episodes"]
         if episodes:
-            filtered = [ep for ep in episodes if ep.get("distance", 1.0) < 0.4]
+            filtered = [ep for ep in episodes if ep.get("distance", 1.0) < 0.45]
             if filtered:
                 ep_lines = []
                 for ep in filtered[:episode_limit]:
-                    text = ep["text"][:120]
+                    text = ep["text"][:160]
                     ep_lines.append(f"- {text}")
                 ep_text = "【相关往事】\n" + "\n".join(ep_lines)
-                parts.append((ep_text, 60))
+                other_parts.append((ep_text, 60))
 
+        dialogue_text = ""
         recent_turns = short.get_recent_turns(max_turns=max_turns)
         if recent_turns:
             dialogue_lines = ["【最近对话】"]
@@ -721,29 +751,45 @@ class CompanionMemory:
                 who = "他" if msg["role"] == "user" else "你"
                 dialogue_lines.append(f"{who}：{msg['content']}")
             dialogue_text = "\n".join(dialogue_lines)
-            parts.append((dialogue_text, 70))
 
+        # 先装近聊（理解预算），再装关系卡/事实
         result_parts = []
         total_len = 0
-        for text, priority in parts:
-            if total_len + len(text) > max_chars and priority < 90:
-                remaining = max_chars - total_len - 50
-                if remaining > 100 and text.startswith("【最近对话】"):
-                    lines = text.split("\n")
-                    kept = [lines[0]]
-                    kept_len = len(lines[0])
-                    for line in reversed(lines[1:]):
-                        if kept_len + len(line) + 1 <= remaining:
-                            kept.insert(1, line)
-                            kept_len += len(line) + 1
-                        else:
-                            break
-                    if len(kept) > 1:
-                        text = "\n".join(kept)
-                        result_parts.append(text)
-                        total_len += len(text)
+        dlg_budget = min(dialogue_reserve, max_chars) if dialogue_text else 0
+        if dialogue_text:
+            if len(dialogue_text) <= dlg_budget:
+                result_parts.append(dialogue_text)
+                total_len += len(dialogue_text)
+            else:
+                lines = dialogue_text.split("\n")
+                kept = [lines[0]]
+                kept_len = len(lines[0])
+                for line in reversed(lines[1:]):
+                    if kept_len + len(line) + 1 <= dlg_budget:
+                        kept.insert(1, line)
+                        kept_len += len(line) + 1
+                    else:
+                        break
+                if len(kept) > 1:
+                    trimmed = "\n".join(kept)
+                    result_parts.append(trimmed)
+                    total_len += len(trimmed)
+
+        other_budget = max_chars - total_len
+        for text, priority in sorted(other_parts, key=lambda x: -x[1]):
+            if total_len + len(text) <= max_chars:
+                result_parts.append(text)
+                total_len += len(text)
                 continue
-            result_parts.append(text)
-            total_len += len(text)
+            remaining = max_chars - total_len - 20
+            if remaining > 120 and priority >= 80:
+                result_parts.append(text[: remaining - 1] + "…")
+                total_len = max_chars
+                break
+
+        # 近聊放最后，便于模型注意（但已保证装入）
+        if dialogue_text and result_parts and result_parts[0].startswith("【最近对话】"):
+            dlg = result_parts.pop(0)
+            result_parts.append(dlg)
 
         return "\n\n".join(result_parts)

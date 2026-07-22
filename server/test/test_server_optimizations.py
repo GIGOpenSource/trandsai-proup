@@ -11,12 +11,12 @@ class TestResolveMaxTokens(unittest.TestCase):
     def test_low_affection(self):
         from services.llm.client import resolve_max_tokens
 
-        self.assertEqual(resolve_max_tokens(10), 128)
+        self.assertEqual(resolve_max_tokens(10), 384)
 
     def test_high_affection(self):
         from services.llm.client import resolve_max_tokens
 
-        self.assertGreaterEqual(resolve_max_tokens(80), 256)
+        self.assertGreaterEqual(resolve_max_tokens(80), 384)
 
 
 class TestMemoryTier(unittest.TestCase):
@@ -47,6 +47,65 @@ class TestMemoryTier(unittest.TestCase):
         compact = mem.build_prompt_context(tier="compact")
         full = mem.build_prompt_context(tier="full", max_chars=3500)
         self.assertLessEqual(len(compact), len(full) + 50)
+
+
+class TestPrepareMemorySlice(unittest.TestCase):
+    def test_prefers_recent_dialogue_over_card_head(self):
+        from services.agent_pipeline_v2 import _slice_memory_for_prepare
+
+        card = "【关系卡】\n" + ("关系摘要很长。" * 80)
+        dialogue = "【最近对话】\n他：那个方案你觉得呢\n你：哪个？\n他：就是昨天说的那个"
+        mem = card + "\n\n" + dialogue
+        sliced = _slice_memory_for_prepare(mem, max_chars=900)
+        self.assertIn("【最近对话】", sliced)
+        self.assertIn("昨天说的那个", sliced)
+        self.assertLessEqual(len(sliced), 920)
+
+    def test_parse_intent_fields(self):
+        from services.agent_pipeline_v2 import _parse_prepare_json
+
+        raw = (
+            '{"user_intent":"问昨天那个方案","must_answer":"表态是否可行",'
+            '"refs":"昨天说的方案","think":"承接上文","mood":"认真",'
+            '"affection_signal":"flat","creative_hint":""}'
+        )
+        data = _parse_prepare_json(raw)
+        self.assertEqual(data["user_intent"], "问昨天那个方案")
+        self.assertIn("可行", data["must_answer"])
+        self.assertEqual(data["refs"], "昨天说的方案")
+
+
+class TestMemoryDialogueReserve(unittest.TestCase):
+    def test_dialogue_kept_when_card_large(self):
+        from unittest.mock import MagicMock
+        from services.memory import CompanionMemory
+
+        mem = CompanionMemory.__new__(CompanionMemory)
+        mem.short_term = MagicMock()
+        mem.short_term.get_recent_turns.return_value = [
+            {"role": "user", "content": "那个你怎么看"},
+            {"role": "assistant", "content": "哪个？"},
+            {"role": "user", "content": "昨天说的方案啊"},
+        ]
+        mem.facts = MagicMock()
+        mem.facts.get_facts.return_value = ["likes coffee"]
+        mem.summary = MagicMock()
+        mem.summary.get_summary.return_value = ""
+        mem.get_context = lambda query="", user_id=None: {
+            "recent_dialogue": [],
+            "episodes": [],
+            "facts": ["likes coffee"],
+            "summary": "",
+        }
+        big_card = "用户喜欢咖啡；" * 200
+        out = mem.build_prompt_context(
+            query="那个你怎么看",
+            tier="full",
+            max_chars=3500,
+            relation_card_text=big_card,
+        )
+        self.assertIn("【最近对话】", out)
+        self.assertIn("昨天说的方案", out)
 
 
 class TestRateLimit(unittest.TestCase):
@@ -279,7 +338,9 @@ class TestAffectionSignal(unittest.TestCase):
     """TC-B6-01"""
 
     def _delta(self, old, signal="up"):
-        base = 0.01 / (1 + float(old or 0) / 20)
+        base_amt = 0.65
+        taper = 30.0
+        base = base_amt / (1 + float(old or 0) / taper)
         sig = (signal or "up").strip().lower()
         if sig == "down":
             return round(-0.5 * base, 4)
@@ -291,12 +352,14 @@ class TestAffectionSignal(unittest.TestCase):
         self.assertLess(self._delta(10.0, "down"), 0)
         self.assertEqual(self._delta(10.0, "flat"), 0)
         self.assertGreater(self._delta(10.0, "up"), 0)
+        self.assertGreater(self._delta(10.0, "up"), 0.3)  # 明显快于旧 0.01 档
         src = open(
             os.path.join(os.path.dirname(__file__), "..", "services", "agent.py"),
             encoding="utf-8",
         ).read()
         self.assertIn("亲密度信号", src)
         self.assertIn('sig == "down"', src)
+        self.assertIn("AFFECTION_BASE", src)
 
 
 class TestRelationCard(unittest.TestCase):
@@ -497,6 +560,7 @@ class TestRollbackFlags(unittest.TestCase):
         self.assertIn('role="archive"', files["agent"])
         self.assertIn("proactive_should_send", files["companions"])
         self.assertIn("push_deny_hook", files["companions"])
+        self.assertIn("push_deny_fingerprints", files["companions"])
 
 
 class TestPhase2HooksAndStage(unittest.TestCase):
@@ -515,7 +579,74 @@ class TestPhase2HooksAndStage(unittest.TestCase):
 
         self.assertEqual(resolve_relation_stage(0, 0), "stranger")
         self.assertEqual(resolve_relation_stage(50, 80), "intimate")
+        # 旧微亲密度 + 多轮：不应永锁 stranger
+        self.assertNotEqual(resolve_relation_stage(34, 0.34), "stranger")
+        self.assertIn("暧昧", stage_instruction(resolve_relation_stage(34, 0.34)))
         self.assertIn("陌生人", stage_instruction("stranger"))
+        self.assertIn("会撩", stage_instruction("intimate"))
+        self.assertIn("绿茶", stage_instruction("ambiguous"))
+        from services.dialogue_phase2 import anti_repeat_hint
+
+        hint = anti_repeat_hint(["今天好累想听你说话"], deny_hooks=["你在干嘛"])
+        self.assertIn("勿复", hint)
+        self.assertIn("忌用", hint)
+        from services.dialogue_phase2 import extract_reply_fingerprints, push_deny_fingerprints
+
+        fps = extract_reply_fingerprints("今天好累。你在干嘛呢？")
+        self.assertTrue(any("在干嘛" in x for x in fps))
+        card2 = push_deny_fingerprints({}, "今天好累。你在干嘛呢？")
+        self.assertTrue(len(card2.get("deny_hooks") or []) >= 1)
+        from services.dialogue_phase2 import seed_deny_from_recent, theme_repeat_hits
+
+        seeded = seed_deny_from_recent([], ["嗯~那你梦到我好不好？", "抱枕最可爱你喜欢什么颜色呀？"])
+        self.assertTrue(any("梦到我" in x or x == "梦到我" for x in seeded))
+        self.assertTrue(any("抱枕" in x or x == "抱枕" for x in seeded))
+        hits = theme_repeat_hits("黄色抱枕最配我啦", ["其实我最喜欢大大的抱枕，你呢？"])
+        self.assertIn("抱枕", hits)
+        from services.dialogue_phase2 import (
+            chat_rules_block,
+            force_single_bubble,
+            leave_close_violations,
+            list_script_skeletons,
+            skeleton_repeat_hits,
+        )
+
+        self.assertTrue(any("明日约定" in s for s in list_script_skeletons("明天念诗集给你听好不好")))
+        sk = skeleton_repeat_hits(
+            "宝贝晚安明天念诗集给你听哦",
+            ["明天念诗集给你听好不好？现在快休息吧"],
+        )
+        self.assertTrue(any("明日约定" in x for x in sk))
+        self.assertTrue(leave_close_violations("晚安呀明天念诗集给你听好吗？"))
+        self.assertIn("离开硬收束", chat_rules_block(has_leave_intent=True, user_input="好的晚安"))
+        self.assertIn("黄腔", chat_rules_block(user_input="我喜欢你的大胸"))
+        self.assertEqual(force_single_bubble("晚安\n\n明天念给你听"), "晚安 明天念给你听")
+        from core.config import detect_leave_intent
+
+        self.assertTrue(detect_leave_intent("那我休息了"))
+        self.assertTrue(detect_leave_intent("好的晚安"))
+        from services.dialogue_quality import (
+            build_respond_quality_hints,
+            diagnose_reply_violations,
+            filter_fact_language,
+        )
+
+        hints = build_respond_quality_hints(
+            user_input="好的晚安", has_leave_intent=True, recent_assistant=["明天念诗集给你听"]
+        )
+        self.assertIn("离开硬收束", hints["leave_hint"])
+        self.assertIn("本轮聊天规则", hints["rules_block"])
+        diag = diagnose_reply_violations(
+            "黄色抱枕最配我，你喜欢什么颜色呀？",
+            user_input="我喜欢你的大胸",
+            recent_assistant=["大大的抱枕才最暖嘛"],
+        )
+        self.assertTrue(diag["need_rewrite"])
+        self.assertTrue(diag["user_tease"] and diag["escape_safe"])
+        self.assertEqual(
+            filter_fact_language(["他加班", "그는 야근"], "我加班了", "zh"),
+            ["他加班"],
+        )
         cands = extract_hook_candidates("周末一起看电影？\n你最近还好吗")
         self.assertTrue(len(cands) >= 1)
         picked = pick_hook(cands, deny_hooks=cands[:1])
@@ -577,22 +708,31 @@ class TestMotiveLayer(unittest.TestCase):
         self.assertEqual(get_content_restriction("zh", 100), "")
 
     def test_extreme_hard_vote(self):
+        import services.motive_layer as ml
         from services.motive_layer import evaluate_turn_motive
 
-        m = evaluate_turn_motive(
-            user_text="我要拉黑你",
-            has_leave_intent=True,
-            inner_text="极端: 是\n极端理由: 断联威胁",
-        )
-        self.assertEqual(m["means_mode"], "extreme")
-        self.assertEqual(m["threat_level"], "L3")
+        prev = ml.MOTIVE_EXTREME_ENABLED
+        ml.MOTIVE_EXTREME_ENABLED = True
+        try:
+            m = evaluate_turn_motive(
+                user_text="我要拉黑你",
+                has_leave_intent=True,
+                inner_text="极端: 是\n极端理由: 断联威胁",
+            )
+            self.assertEqual(m["means_mode"], "extreme")
+            self.assertEqual(m["threat_level"], "L3")
+        finally:
+            ml.MOTIVE_EXTREME_ENABLED = prev
 
     def test_persona_default(self):
         from services.motive_layer import evaluate_turn_motive, motive_block
 
         m = evaluate_turn_motive(user_text="今天天气不错")
         self.assertEqual(m["means_mode"], "persona")
-        self.assertIn("被忽视=死亡", motive_block("zh"))
+        zh = motive_block("zh")
+        self.assertIn("关系重要", zh)
+        self.assertIn("禁止", zh)
+        self.assertNotIn("被忽视=死亡", zh)
 
     def test_agent_wires_motive(self):
         agent = open(

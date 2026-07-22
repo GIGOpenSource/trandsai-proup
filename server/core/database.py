@@ -350,14 +350,29 @@ def get_db() -> Generator[Any, None, None]:
         db.close()
 
 
+def _qident(name: str) -> str:
+    """Quote SQL identifier for current dialect (MySQL backticks vs PG/SQLite double quotes)."""
+    if _is_mysql:
+        return f"`{name}`"
+    return f'"{name}"'
+
+
 def _ensure_column(table_name: str, column_name: str, column_def: str):
     """检查并添加缺失的数据库列（兼容已有表）"""
     from sqlalchemy import inspect, text
     inspector = inspect(engine)
     cols = [c["name"] for c in inspector.get_columns(table_name)]
     if column_name not in cols:
+        # DATETIME is MySQL; map for PostgreSQL
+        col_def = column_def
+        if _is_postgres and "DATETIME" in col_def.upper():
+            col_def = col_def.replace("DATETIME", "TIMESTAMP").replace("datetime", "TIMESTAMP")
         with engine.connect() as conn:
-            conn.execute(text(f'ALTER TABLE {table_name} ADD COLUMN "{column_name}" {column_def}'))
+            conn.execute(
+                text(
+                    f"ALTER TABLE {_qident(table_name)} ADD COLUMN {_qident(column_name)} {col_def}"
+                )
+            )
             conn.commit()
         logger.info("[init_db] 添加列 %s.%s", table_name, column_name)
 
@@ -371,10 +386,12 @@ def _ensure_unique_index(table_name: str, index_name: str, columns: list[str]):
     if index_name in existing_indexes:
         return
 
-    quoted_cols = ", ".join(f'"{col}"' for col in columns)
+    quoted_cols = ", ".join(_qident(col) for col in columns)
     with engine.connect() as conn:
         conn.execute(
-            text(f'CREATE UNIQUE INDEX "{index_name}" ON "{table_name}" ({quoted_cols})')
+            text(
+                f"CREATE UNIQUE INDEX {_qident(index_name)} ON {_qident(table_name)} ({quoted_cols})"
+            )
         )
         conn.commit()
     logger.info("[init_db] 添加唯一索引 %s.%s", table_name, index_name)
@@ -481,7 +498,7 @@ def init_db():
             if not db.query(AgentConfigORM).first():
                 default_cfg = {
                     "model_provider": os.getenv("MODEL_PROVIDER", "anthropic"),
-                    "temperature": 0.93,
+                    "temperature": 0.8,
                     "max_tokens": 2048,
                     "system_prompt_zh": "",
                     "system_prompt_en": "",
@@ -518,7 +535,7 @@ def init_db():
                     "config_type": "agent",
                     "config_json": {
                         "model_provider": os.getenv("MODEL_PROVIDER", "anthropic"),
-                        "temperature": 0.93,
+                        "temperature": 0.8,
                         "max_tokens": 2048,
                         "system_prompt_zh": "",
                         "system_prompt_en": "",

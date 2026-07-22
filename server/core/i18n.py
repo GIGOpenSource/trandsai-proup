@@ -26,6 +26,7 @@ _LEAVE_INTENT_KEYWORDS = [
     # 中文
     "走了", "去忙", "晚安", "拜拜", "再见", "睡了", "累了", "改天", "先这样",
     "回头聊", "下了", "撤了", "不聊了", "有事", "要忙", "先走", "回聊",
+    "休息了", "我休息", "去睡", "睡觉了", "不聊", "先睡",
     # 英文
     "gotta go", "gtg", "ttyl", "goodnight", "bye", "later", "sleep", "tired",
     "gotta run", "brb", "afk", "leaving", "need to go", "busy now",

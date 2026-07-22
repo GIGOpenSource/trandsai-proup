@@ -59,8 +59,10 @@ from services.relation_card import (
 from services.dialogue_phase2 import (
     merge_open_threads,
     proactive_should_send,
+    push_deny_fingerprints,
     push_deny_hook,
     resolve_relation_stage,
+    seed_deny_from_recent,
 )
 from services.archive_queue import enqueue_archive_job, archive_queue_enabled
 from services.archive_process import process_archive_job
@@ -138,11 +140,13 @@ def _burst_mood_from_user_text(s: str) -> str:
 
 
 def _inject_soft_linebreaks_for_mixed_messages(s: str) -> str:
-    """在纯正文段内补换行以便拆多条气泡；均从左到右扫描，不改变未匹配片段顺序。
-    先「句末+直接接中文」再「句末+空白+中文」，避免与 split_response 的换行规则打架。"""
+    """少切气泡：仅在「句末 + 空白 + 下一句」时换行；不再对紧挨着的句号后强制切分。
+
+    REQ-A7：无条间 sleep；减少机枪式短气泡。
+    """
     if not (s or "").strip():
         return s or ""
-    s = _TIGHT_BREAK_AFTER_CJK_SENTENCE.sub("\n", s)
+    # 仅保留有空白的软换行；去掉 tight break（句号后立刻切条）
     s = _SOFT_BREAK_AFTER_CJK_SENTENCE.sub("\n", s)
     return s
 
@@ -270,11 +274,11 @@ async def _deliver_assistant_content(
             continue
         body = _inject_soft_linebreaks_for_mixed_messages(body)
         if delivery_mood == "excited":
-            _mc = random.randint(100, 140)
+            _mc = random.randint(160, 220)
         elif delivery_mood == "calm":
-            _mc = random.randint(175, 235)
+            _mc = random.randint(220, 320)
         else:
-            _mc = random.randint(128, 175)
+            _mc = random.randint(180, 260)
         subsegs = split_response(body, max_chars=_mc)
         for j, sub in enumerate(subsegs):
             if await _interrupted():
@@ -605,8 +609,11 @@ _PERSONA_GENERATE_PROMPT = """你是一个专业的人物设定作家。请根�
 要求：
 1. 生成的内容必须和已知的基础信息（姓名、年龄、性别、城市、性格、MBTI）高度一致
 2. 内容要口语化、有画面感、真实可信，不要模板化
-3. 成长经历要包含：童年、青少年、成年、原生家庭影响、重大转折点、内心创伤与成长
-4. 每个字段都要独立且丰富
+3. 成长经历（life_story）必须包含：童年、青少年、成年、原生家庭影响、重大转折点、内心创伤与成长；不少于 180 字
+4. 文化三观与意识形态（cultural_values）写清价值排序、对权威/自由/集体的态度；不少于 80 字
+5. 性别观念与认知（gender_perspective）写清对性别角色、亲密关系中的平等与边界；不少于 80 字
+6. 每个字段都要独立且非空；禁止省略后三个深度字段
+7. 控制总长度：除 life_story 外，其余字段各 40–160 字，避免超长导致 JSON 截断
 
 基础信息：
 - 姓名：{name}
@@ -619,8 +626,12 @@ _PERSONA_GENERATE_PROMPT = """你是一个专业的人物设定作家。请根�
 
 {cultural_context}
 
-请直接返回一个 JSON 对象，不要返回任何解释文字。JSON 格式如下：
+请直接返回一个 JSON 对象，不要返回任何解释文字、不要 Markdown 代码块。
+字段顺序必须如下（先写三个深度字段，再写其余）：
 {{
+  "life_story": "...",
+  "cultural_values": "...",
+  "gender_perspective": "...",
   "background": "...",
   "speech_style": "...",
   "hobbies": "...",
@@ -628,17 +639,28 @@ _PERSONA_GENERATE_PROMPT = """你是一个专业的人物设定作家。请根�
   "fears": "...",
   "love_view": "...",
   "daily_routine": "...",
-  "favorite_things": "...",
-  "life_story": "...",
-  "cultural_values": "...",
-  "gender_perspective": "..."
+  "favorite_things": "..."
 }}
 """
 
+_PERSONA_REQUIRED_KEYS = (
+    "life_story",
+    "cultural_values",
+    "gender_perspective",
+    "background",
+    "speech_style",
+    "hobbies",
+    "values",
+    "fears",
+    "love_view",
+    "daily_routine",
+    "favorite_things",
+)
+
 
 def _extract_json(text: str) -> dict:
-    """从 LLM 返回中提取 JSON"""
-    text = text.strip()
+    """从 LLM 返回中提取 JSON；容忍代码块与轻度截断。"""
+    text = (text or "").strip()
     if text.startswith("```json"):
         text = text[7:]
     if text.startswith("```"):
@@ -646,15 +668,77 @@ def _extract_json(text: str) -> dict:
     if text.endswith("```"):
         text = text[:-3]
     text = text.strip()
-    # 尝试直接解析
+
+    def _loads(raw: str) -> dict:
+        return json.loads(raw)
+
     try:
-        return json.loads(text)
+        data = _loads(text)
+        if isinstance(data, dict):
+            return data
     except json.JSONDecodeError:
-        # 尝试正则提取 JSON 块
-        match = re.search(r'\{[\s\S]*\}', text)
-        if match:
-            return json.loads(match.group(0))
-        raise
+        pass
+
+    match = re.search(r"\{[\s\S]*\}", text)
+    if match:
+        chunk = match.group(0)
+        try:
+            data = _loads(chunk)
+            if isinstance(data, dict):
+                return data
+        except json.JSONDecodeError:
+            # 常见截断：补齐未闭合引号/括号后重试
+            repaired = chunk.rstrip()
+            if repaired.count('"') % 2 == 1:
+                repaired += '"'
+            # 去掉尾部残缺的 key/value 碎片，回退到最后一个完整字段
+            last_comma = repaired.rfind(",")
+            if last_comma > 0:
+                repaired = repaired[:last_comma]
+            repaired += "}"
+            try:
+                data = _loads(repaired)
+                if isinstance(data, dict):
+                    return data
+            except json.JSONDecodeError:
+                pass
+    raise ValueError("LLM 返回无法解析为 JSON")
+
+
+def _normalize_persona_result(result: dict, data: dict) -> dict:
+    """保证必填键存在；缺深度字段时用基础信息兜底，避免前端空白。"""
+    out = {k: (str(result.get(k) or "").strip()) for k in _PERSONA_REQUIRED_KEYS}
+    name = data.get("name") or "ta"
+    city = data.get("city") or ""
+    personality = data.get("personality") or ""
+    gender = data.get("gender") or ""
+    bg = out["background"] or f"{name}生活在{city}，性格偏向{personality}。"
+    if not out["background"]:
+        out["background"] = bg
+    if not out["life_story"]:
+        out["life_story"] = (
+            f"{name}在{city}长大，性格里带着「{personality}」的底色。"
+            f"童年与少年时期逐渐形成自我节奏；成年后的选择与这段经历紧密相连：{bg}"
+            "原生家庭既给过温暖，也留下需要慢慢消化的张力；后来经历过明显转折，"
+            "学会了在受伤后重新站稳，并把真正在意的事放在更前面。"
+        )
+    if not out["cultural_values"]:
+        values = out["values"] or "真实与尊重"
+        out["cultural_values"] = (
+            f"{name}的三观务实而带理想主义，更看重{values}。"
+            "不爱空喊口号，而在具体选择里守住底线；冲突时倾向沟通与边界，而不是压倒对方。"
+        )
+    if not out["gender_perspective"]:
+        love = out["love_view"] or "希望关系里有尊重与陪伴"
+        out["gender_perspective"] = (
+            f"作为{gender or '个体'}，{name}拒绝把性别当成枷锁或标签。"
+            f"更在意平等、尊重与情绪责任的分担。亲密关系上：{love}。"
+            "角色可以传统也可以现代，前提是双方自愿且平等。"
+        )
+    for k in _PERSONA_REQUIRED_KEYS:
+        if not out[k]:
+            out[k] = f"（待完善）{k}"
+    return out
 
 
 @router.post("/companions/generate")
@@ -692,12 +776,25 @@ async def api_generate_persona(data: dict):
     )
 
     try:
-        llm = get_llm(temperature=0.9, max_tokens=4096)
-        resp = llm_invoke(llm, [SystemMessage(content=prompt)], node="persona_generate", max_tokens=4096)
+        # 人设 JSON 较长：给足 tokens，避免后写字段被截断；上限保持保守以免部分供应商拒收
+        llm = get_llm(temperature=0.85, max_tokens=4096, role="respond")
+        resp = await run_rest(
+            lambda: llm_invoke(
+                llm,
+                [SystemMessage(content=prompt)],
+                node="persona_generate",
+                max_tokens=4096,
+            )
+        )
         text = resp.content.strip() if hasattr(resp, "content") else str(resp)
         result = _extract_json(text)
-        return result
+        if not isinstance(result, dict):
+            raise ValueError("生成结果不是 JSON 对象")
+        return _normalize_persona_result(result, data)
+    except HTTPException:
+        raise
     except Exception as e:
+        logger.exception("persona generate failed: %s", e)
         raise HTTPException(status_code=500, detail=f"生成失败: {str(e)}")
 
 
@@ -1002,12 +1099,14 @@ async def ws_chat(websocket: WebSocket, companion_id: str):
             )
             recent_assistant = []
             try:
-                for t in companion.memory.short_term.get_recent_turns(max_turns=6):
+                for t in companion.memory.short_term.get_recent_turns(max_turns=10):
                     if t.get("role") == "assistant" and (t.get("content") or "").strip():
                         recent_assistant.append(t["content"])
-                recent_assistant = recent_assistant[-3:]
+                recent_assistant = recent_assistant[-5:]
             except Exception:
                 recent_assistant = []
+            # 忌用窗以近聊为准补齐（关系卡 deny 常被异步事实任务冲空）
+            deny_hooks = seed_deny_from_recent(deny_hooks, recent_assistant)
             # C3 / M*：idle 与极端冷却时间戳（先算 idle，再刷新 last_user_ts）
             session_meta_pre = get_session(companion_id) or {}
             idle_seconds = None
@@ -1316,6 +1415,28 @@ async def ws_chat(websocket: WebSocket, companion_id: str):
                 companion.state.affection = result["affection"]
                 companion.state.turns += 1
 
+                # 关系卡忌用指纹必须在后台任务前落库，避免 BG merge_facts 竞态清空
+                if RELATION_CARD_ENABLED:
+                    c = touch_state(
+                        load_card(user_id, companion_id),
+                        mood=companion.state.mood,
+                        affection=companion.state.affection,
+                        summary=companion.state.summary,
+                    )
+                    if result.get("new_facts") and not result.get("facts_async_pending"):
+                        c = merge_facts(c, result.get("new_facts") or [])
+                    picked = (result.get("picked_hook") or "").strip()
+                    if picked:
+                        c = push_deny_hook(c, picked)
+                        c = merge_open_threads(c, new_thread=picked)
+                    c = push_deny_fingerprints(c, actual_response or response_text)
+                    stage = (result.get("relation_stage") or "").strip() or resolve_relation_stage(
+                        int(getattr(companion.state, "turns", 0) or 0),
+                        float(getattr(companion.state, "affection", 0) or 0),
+                    )
+                    c["stage"] = stage
+                    save_card(user_id, companion_id, c)
+
                 if memory_snapshot:
                     companion.save_state(user_id=user_id)
                     snapshot_for_bg = {
@@ -1334,7 +1455,30 @@ async def ws_chat(websocket: WebSocket, companion_id: str):
                             if mem.get("new_facts"):
                                 companion.memory.facts.add_facts(mem["new_facts"])
                                 if RELATION_CARD_ENABLED:
-                                    c = merge_facts(load_card(user_id, companion_id), mem["new_facts"])
+                                    c = load_card(user_id, companion_id)
+                                    deny_before = list(c.get("deny_hooks") or [])
+                                    stage_before = c.get("stage")
+                                    c = merge_facts(c, mem["new_facts"])
+                                    # 后台不得冲掉主线程刚写入的忌用指纹/阶段
+                                    latest = load_card(user_id, companion_id)
+                                    merged = []
+                                    seen = set()
+                                    for d in (
+                                        list(latest.get("deny_hooks") or [])
+                                        + deny_before
+                                        + list(c.get("deny_hooks") or [])
+                                    ):
+                                        s = str(d).strip()
+                                        if s and s not in seen:
+                                            seen.add(s)
+                                            merged.append(s)
+                                    c["deny_hooks"] = merged[-20:]
+                                    c["stage"] = (
+                                        latest.get("stage")
+                                        or stage_before
+                                        or c.get("stage")
+                                        or "stranger"
+                                    )
                                     save_card(user_id, companion_id, c)
                             if mem.get("new_summary") and companion.memory.summary.should_update():
                                 companion.memory.summary.update(mem["new_summary"])
@@ -1403,41 +1547,42 @@ async def ws_chat(websocket: WebSocket, companion_id: str):
                                 if facts:
                                     companion.memory.facts.add_facts(facts)
                                     if RELATION_CARD_ENABLED:
+                                        c = load_card(user_id, companion_id)
+                                        deny_keep = list(c.get("deny_hooks") or [])
+                                        stage_keep = c.get("stage")
                                         c = merge_facts(
                                             touch_state(
-                                                load_card(user_id, companion_id),
+                                                c,
                                                 mood=companion.state.mood,
                                                 affection=companion.state.affection,
                                                 summary=companion.state.summary,
                                             ),
                                             facts,
                                         )
+                                        latest = load_card(user_id, companion_id)
+                                        merged_deny = []
+                                        seen_d = set()
+                                        for d in (
+                                            list(latest.get("deny_hooks") or [])
+                                            + deny_keep
+                                            + list(c.get("deny_hooks") or [])
+                                        ):
+                                            s = str(d).strip()
+                                            if s and s not in seen_d:
+                                                seen_d.add(s)
+                                                merged_deny.append(s)
+                                        c["deny_hooks"] = merged_deny[-20:]
+                                        c["stage"] = (
+                                            latest.get("stage")
+                                            or stage_keep
+                                            or c.get("stage")
+                                            or "ambiguous"
+                                        )
                                         save_card(user_id, companion_id, c)
                             except Exception as e:
                                 logger.warning("Async facts failed/dropped: %s", e)
 
                         asyncio.create_task(_async_facts())
-
-                if RELATION_CARD_ENABLED:
-                    c = touch_state(
-                        load_card(user_id, companion_id),
-                        mood=companion.state.mood,
-                        affection=companion.state.affection,
-                        summary=companion.state.summary,
-                    )
-                    if result.get("new_facts") and not result.get("facts_async_pending"):
-                        c = merge_facts(c, result.get("new_facts") or [])
-                    # C2/C6：钩子滑动窗 + 话题债 + 阶段
-                    picked = (result.get("picked_hook") or "").strip()
-                    if picked:
-                        c = push_deny_hook(c, picked)
-                        c = merge_open_threads(c, new_thread=picked)
-                    stage = (result.get("relation_stage") or "").strip() or resolve_relation_stage(
-                        int(getattr(companion.state, "turns", 0) or 0),
-                        float(getattr(companion.state, "affection", 0) or 0),
-                    )
-                    c["stage"] = stage
-                    save_card(user_id, companion_id, c)
 
                 if result.get("means_mode") == "extreme":
                     sess_x = get_session(companion_id) or {}

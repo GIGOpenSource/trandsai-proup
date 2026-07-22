@@ -108,8 +108,14 @@ def hydrate_user_affection_turns(companion: "Companion", user_id: int) -> None:
             .first()
         )
         if ur:
-            companion.state.affection = ur.affection if ur.affection is not None else 0
-            companion.state.turns = ur.turns if ur.turns is not None else 0
+            aff = float(ur.affection if ur.affection is not None else 0)
+            turns = int(ur.turns if ur.turns is not None else 0)
+            # 旧公式微增量：多轮后仍 <3，补齐到可进入暧昧的可玩区间（只抬低值，不降低）
+            if turns >= 12 and aff < 3:
+                aff = min(45.0, max(aff, turns * 0.9))
+                ur.affection = aff
+            companion.state.affection = aff
+            companion.state.turns = turns
             return
         gr = (
             db.query(CompanionStateORM)

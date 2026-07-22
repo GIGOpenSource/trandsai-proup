@@ -17,6 +17,7 @@ from services.agent_prompts import (
     _HUMANIZE_CONFIG,
     _SEXUAL_ORIENTATION_TEXTS,
     _SYSTEM_PROMPTS,
+    adult_intimacy_guidance,
 )
 
 logger = logging.getLogger(__name__)
@@ -109,42 +110,39 @@ def _get_agent_config(companion_id: str = None) -> dict:
     return result
 
 
-# ===== humanize 后处理：按语言让文字像真人 =====
+# ===== humanize 后处理：默认仅清违禁词；可 HUMANIZE=1 开轻量语气 =====
 def humanize(text: str, lang: str = "zh") -> str:
     if not text:
         return text
 
+    mode = (os.getenv("HUMANIZE", "scrub") or "scrub").lower()
+    # 0/false/off/scrub：只清洗违禁词，避免叠词/~破坏表达逻辑
+    if mode in ("0", "false", "no", "off", "scrub"):
+        lower = text.lower()
+        for b in _BANNED_WORDS:
+            if b.lower() in lower:
+                text = re.sub(re.escape(b), "", text, flags=re.IGNORECASE)
+        return text.strip()
+
     cfg = _HUMANIZE_CONFIG.get(lang, _HUMANIZE_CONFIG["zh"])
 
-    # 1. 偶尔小错别字（约 3% 概率）
-    chars = list(text)
-    for i, ch in enumerate(chars):
-        if ch in cfg["typo_map"] and random.random() < 0.03:
-            chars[i] = cfg["typo_map"][ch]
-    text = "".join(chars)
+    # 1. 错字突变已关闭
 
-    # 2. 句尾随机加波浪号或表情（约 25% 的句子）
+    # 2. 句尾轻量语气（约 3%）
     sentences = re.split(r"([" + re.escape(cfg["end_punct"]) + r"\n]+)", text)
     new_sentences = []
     for s in sentences:
         if s.strip() and s[-1] in cfg["end_punct"]:
-            if random.random() < 0.25:
+            if random.random() < 0.03:
                 s = s.rstrip(cfg["end_punct"]) + random.choice(cfg["tail_options"])
-                if random.random() < 0.4:
+                if random.random() < 0.08:
                     s += random.choice(cfg["emojis"])
         new_sentences.append(s)
     text = "".join(new_sentences)
 
-    # 3. 偶尔重复词（约 10%）
-    for pat in cfg["repeat_patterns"]:
-        if pat in text and random.random() < 0.10:
-            text = text.replace(pat, pat + pat, 1)
+    # 3. 叠词扰动默认关闭（易造成「真的真的」式语病）
 
-    # 4. 偶尔省略标点变成空格或换行
-    for p in cfg["mid_punct"]:
-        text = re.sub(re.escape(p), lambda m: " " if random.random() < 0.08 else m.group(0), text)
-
-    # 5. 确保不会以AI/模型/虚拟相关词汇结尾
+    # 4. 清洗违禁词
     lower = text.lower()
     for b in _BANNED_WORDS:
         if b.lower() in lower:
@@ -450,14 +448,14 @@ def get_current_time_info() -> str:
 _FIRST_TURN_OVERRIDES = {
     "zh": """【关系阶段——最高优先级覆盖】
 这是你和对方的第一次对话。你们刚刚认识，彼此完全不了解。
-请你以陌生人的方式自然地打个招呼：礼貌、简短、略带拘谨和好奇。
-绝对禁止：使用亲昵称呼（宝贝、老公、老婆等）、表达强烈的爱意或依赖、提及过去共同的回忆。
+请你以陌生人的方式自然地打招呼：礼貌、略带拘谨和好奇；可用一两句带人设特色的观察（城市、工作碎片等），总长度大约 30～70 字。
+绝对禁止：使用亲昵称呼（宝贝、老公、老婆等）、表达强烈的爱意或依赖、提及过去共同的回忆、每句结尾硬塞问题钩子。
 你目前只是对这个人印象不错，但还没有产生任何深厚的感情。请保持陌生人之间的社交距离。
 本条规则优先级高于本提示中所有"深深爱着""亲密伙伴"等描述。""",
     "en": """[Relationship Stage — HIGHEST PRIORITY OVERRIDE]
 This is your very first conversation. You have just met and know nothing about each other.
-Greet them like a stranger: polite, brief, slightly reserved and curious.
-STRICTLY FORBIDDEN: pet names, expressions of deep love or dependency, references to shared past memories.
+Greet them like a stranger: polite, slightly reserved and curious; include one persona-flavored observation. About 30–70 words.
+STRICTLY FORBIDDEN: pet names, expressions of deep love or dependency, references to shared past memories, forced ending hooks every sentence.
 You only have a mild positive impression of this person. Maintain appropriate social distance.
 This rule overrides any \"deeply in love\" or \"close lover\" descriptions in this prompt.""",
     "ja": """【関係段階——最優先オーバーライド】
@@ -544,7 +542,9 @@ def _build_core_prompt(
         personality = f"{personality}\n{evolved['personality'][:150]}"
     return (
         f"你是{name}。性格：{personality}\n口癖/说话风格：{speech}\n"
-        f"当前对话轮次：{turns}。请用{lang}进行内心分析，输出简洁 JSON。"
+        f"当前对话轮次：{turns}。请用{lang}进行内心分析，输出简洁 JSON。\n"
+        "理解优先：先弄清用户本轮意图、必须回应点、指代/省略。\n"
+        "风格备忘：可会撩、可绿茶张力，但先接住用户的话；禁止答非所问。"
     )
 
 

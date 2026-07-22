@@ -50,21 +50,8 @@ def run_agent(
     )
     if version == "v2":
         try:
-            v2_kwargs = {
-                k: v
-                for k, v in kwargs.items()
-                if k
-                not in (
-                    "has_leave_intent",
-                    "burst_count",
-                    "open_threads",
-                    "deny_hooks",
-                    "recent_assistant",
-                    "idle_seconds",
-                    "last_extreme_ts",
-                )
-            }
-            return run_pipeline_v2(**v2_kwargs)
+            # 贯通反重复 / 离开意图 / 话题债；其余 v1 专属字段由 **_extra 忽略
+            return run_pipeline_v2(**kwargs)
         except Exception as e:
             logger.warning("Pipeline v2 failed, fallback to v1: %s", e, exc_info=True)
     return run_pipeline_v1(**kwargs)

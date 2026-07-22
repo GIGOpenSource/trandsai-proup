@@ -1,3 +1,4 @@
+from __future__ import annotations
 # 地区文化数据 —— 姓名、城市、文化常识
 
 # ===== 姓名库（按语言和性别） =====
