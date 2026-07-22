@@ -20,6 +20,8 @@ services:
     restart: always
     networks:
       - trand_net
+    ports:
+      - "5432:5432"
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-trandsai}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-trandsai123}
@@ -186,6 +188,8 @@ services:
     restart: always
     networks:
       - trand_net
+    ports:
+      - "6379:6379"
     volumes:
       - redis_data:/data
     command: redis-server --appendonly yes

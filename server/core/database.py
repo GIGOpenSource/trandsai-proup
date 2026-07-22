@@ -357,7 +357,7 @@ def _ensure_column(table_name: str, column_name: str, column_def: str):
     cols = [c["name"] for c in inspector.get_columns(table_name)]
     if column_name not in cols:
         with engine.connect() as conn:
-            conn.execute(text(f"ALTER TABLE {table_name} ADD COLUMN `{column_name}` {column_def}"))
+            conn.execute(text(f'ALTER TABLE {table_name} ADD COLUMN "{column_name}" {column_def}'))
             conn.commit()
         logger.info("[init_db] 添加列 %s.%s", table_name, column_name)
 
@@ -371,10 +371,10 @@ def _ensure_unique_index(table_name: str, index_name: str, columns: list[str]):
     if index_name in existing_indexes:
         return
 
-    quoted_cols = ", ".join(f"`{col}`" for col in columns)
+    quoted_cols = ", ".join(f'"{col}"' for col in columns)
     with engine.connect() as conn:
         conn.execute(
-            text(f"CREATE UNIQUE INDEX `{index_name}` ON `{table_name}` ({quoted_cols})")
+            text(f'CREATE UNIQUE INDEX "{index_name}" ON "{table_name}" ({quoted_cols})')
         )
         conn.commit()
     logger.info("[init_db] 添加唯一索引 %s.%s", table_name, index_name)
