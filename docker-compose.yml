@@ -38,7 +38,7 @@ services:
     container_name: trandsai-nginx
     restart: always
     ports:
-      - "8098:80"
+      - "80:80"
     networks:
       - trand_net
     volumes:
