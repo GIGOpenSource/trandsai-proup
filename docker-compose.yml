@@ -1,0 +1,195 @@
+networks:
+  trand_net:
+    driver: bridge
+
+services:
+  # 构建基础镜像（只需运行一次）
+  base:
+    build:
+      context: .
+      dockerfile: Dockerfile.base
+    image: trandsai-base:latest
+    container_name: trandsai-base-builder
+    profiles:
+      - base
+
+  # PostgreSQL 数据库
+  postgres:
+    image: postgres:16-alpine
+    container_name: trandsai-postgres
+    restart: always
+    networks:
+      - trand_net
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-trandsai}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-trandsai123}
+      POSTGRES_DB: ${POSTGRES_DB:-trandsai}
+      TZ: Asia/Shanghai
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-trandsai}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: trandsai-nginx
+    restart: always
+    ports:
+      - "8098:80"
+    networks:
+      - trand_net
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf
+      - ./client/dist:/usr/share/nginx/html/client:ro
+      - ./admin/dist:/usr/share/nginx/html/admin:ro
+      - ./data:/usr/share/nginx/html/data:ro
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    depends_on:
+      - backend
+
+  backend:
+    image: trandsai-base:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: trandsai-backend
+    restart: always
+    networks:
+      - trand_net
+    volumes:
+      - ./server:/app
+      - ./data:/app/data
+      - ./.env:/project_root/.env:ro
+      - ./scripts:/app/scripts:ro
+    working_dir: /app
+    environment:
+      TZ: Asia/Shanghai
+      DOTENV_PATH: /project_root/.env
+      APP_ENV: production
+      DATABASE_URL: postgresql://${POSTGRES_USER:-trandsai}:${POSTGRES_PASSWORD:-trandsai123}@postgres:5432/${POSTGRES_DB:-trandsai}
+      REDIS_URL: redis://redis:6379/0
+      ARQ_REDIS_URL: redis://redis:6379/1
+      CHAT_REDIS_BRIDGE: "1"
+      CHAT_FLUSH_INTERVAL: "2"
+      CHAT_FLUSH_BATCH: "30"
+      CHAT_BUFFER_MAX: "200"
+      AGENT_POOL_SIZE: "16"
+      REST_POOL_SIZE: "8"
+      MAX_CONCURRENT_AGENTS: "20"
+      MAX_LLM_CONCURRENT: "50"
+      AGENT_PIPELINE: "v2"
+      DELIVERY_DELAY_FACTOR: "0.6"
+      AGENT_QUEUE: ${AGENT_QUEUE:-0}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-change-me-strong-password}
+      MODEL_PROVIDER: ${MODEL_PROVIDER:-grok}
+      XAI_API_KEY: ${XAI_API_KEY:-}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+
+  agent-worker:
+    image: trandsai-base:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: trandsai-agent-worker
+    restart: always
+    networks:
+      - trand_net
+    volumes:
+      - ./server:/app
+      - ./data:/app/data
+      - ./.env:/project_root/.env:ro
+    working_dir: /app
+    command: arq workers.agent_worker.WorkerSettings
+    environment:
+      TZ: Asia/Shanghai
+      DOTENV_PATH: /project_root/.env
+      APP_ENV: production
+      DATABASE_URL: postgresql://${POSTGRES_USER:-trandsai}:${POSTGRES_PASSWORD:-trandsai123}@postgres:5432/${POSTGRES_DB:-trandsai}
+      REDIS_URL: redis://redis:6379/0
+      ARQ_REDIS_URL: redis://redis:6379/1
+      CHAT_REDIS_BRIDGE: "1"
+      AGENT_PIPELINE: "v2"
+      AGENT_POOL_SIZE: "16"
+      AGENT_WORKER_MAX_JOBS: "10"
+      AGENT_JOB_TIMEOUT: "120"
+      MODEL_PROVIDER: ${MODEL_PROVIDER:-grok}
+      XAI_API_KEY: ${XAI_API_KEY:-}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+    profiles:
+      - queue
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+
+  agent-worker-priority:
+    image: trandsai-base:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: trandsai-agent-worker-priority
+    restart: always
+    networks:
+      - trand_net
+    volumes:
+      - ./server:/app
+      - ./data:/app/data
+      - ./.env:/project_root/.env:ro
+    working_dir: /app
+    command: arq workers.agent_worker.WorkerSettings
+    environment:
+      TZ: Asia/Shanghai
+      DOTENV_PATH: /project_root/.env
+      APP_ENV: production
+      DATABASE_URL: postgresql://${POSTGRES_USER:-trandsai}:${POSTGRES_PASSWORD:-trandsai123}@postgres:5432/${POSTGRES_DB:-trandsai}
+      REDIS_URL: redis://redis:6379/0
+      ARQ_REDIS_URL: redis://redis:6379/1
+      CHAT_REDIS_BRIDGE: "1"
+      AGENT_PIPELINE: "v2"
+      AGENT_POOL_SIZE: "16"
+      AGENT_WORKER_MAX_JOBS: "10"
+      AGENT_JOB_TIMEOUT: "120"
+      AGENT_WORKER_QUEUE: "agent:priority"
+      MODEL_PROVIDER: ${MODEL_PROVIDER:-grok}
+      XAI_API_KEY: ${XAI_API_KEY:-}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+    profiles:
+      - queue
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+
+  redis:
+    image: redis:7-alpine
+    container_name: trandsai-redis
+    restart: always
+    networks:
+      - trand_net
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+
+volumes:
+  redis_data:
+  postgres_data:

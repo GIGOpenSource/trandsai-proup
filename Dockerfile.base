@@ -1,0 +1,28 @@
+FROM python:3.11-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+ENV TZ=Asia/Shanghai
+
+WORKDIR /app
+
+# 使用阿里云镜像源加速 apt 安装
+RUN sed -i 's/deb.debian.org/mirrors.aliyun.com/g' /etc/apt/sources.list.d/debian.sources
+
+# 安装必要依赖
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libpq-dev \
+    wget \
+    && rm -rf /var/lib/apt/lists/*
+
+# 复制并安装 Python 依赖（使用阿里云 pip 镜像）
+COPY server/requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com
+
+# 基础镜像标签
+LABEL maintainer="trandsai"
+LABEL version="1.0"
+LABEL description="Trandsai Backend Base Image"
+
+# 默认指令
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
