@@ -43,8 +43,8 @@ services:
       - trand_net
     volumes:
       - ./nginx.conf:/etc/nginx/conf.d/default.conf
-      - ./client/dist:/usr/share/nginx/html/client:ro
-      - ./admin/dist:/usr/share/nginx/html/admin:ro
+      - ./page/frontend:/usr/share/nginx/html/client:ro
+      - ./page/admin:/usr/share/nginx/html/admin:ro
       - ./data:/usr/share/nginx/html/data:ro
     healthcheck:
       test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1/"]
