@@ -76,6 +76,7 @@
 | **Q4** | 每轮近聊种子忌用窗 | `seed_deny_from_recent`（`companions.py` WS） |
 | **Q5** | 事实语言门禁 | `agent._filter_facts_by_user_lang`；`relation_card.merge_facts` 拒韩文 |
 | **Q6** | 本轮聊天规则块注入 | `chat_rules_block` / `build_respond_quality_hints` |
+| **Q7** | 亲密度↑ → 成人对话接受度↑ | `adult_intimacy_guidance` → `get_content_restriction`（默认 off） |
 
 ### 2.1 调用顺序（v2）
 

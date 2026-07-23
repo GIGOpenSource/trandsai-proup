@@ -33,7 +33,7 @@ from services.agent_utils import build_dialogue_time_context, build_system_promp
 from services.agent_runner import run_agent, run_memory_update_async
 from services.agent import get_llm
 from services.llm.client import llm_invoke
-from services.culture_data import get_cultural_context
+from services.culture_data import get_cultural_context_for_city, default_cultural_values, infer_language_from_city
 from services.memory import normalize_message_text_for_dedup
 from services.image_generation import generate_avatar_prompt, generate_image_with_cache
 from core.i18n import (
@@ -389,7 +389,7 @@ They haven't replied for a while. As {name}, send a proactive message — check 
 Requirements:
 - Completely colloquial, like texting a lover
 - 2-3 short sentences, each under 25 words
-- Must end with a hook (question or invitation to reply)
+- Prefer a statement or share; ending with a question is optional — do not always ask
 - Output the reply directly, no prefix
 
 {restriction_text}"""
@@ -410,7 +410,7 @@ Requirements:
 要求：
 - 完全に口語体、伙伴とのLINEのような感じ
 - 2〜3文、それぞれ25字以内
-- 最後は必ずフック（質問や返信の誘い）
+- 最後は質問で締めなくてよい；陳述・共有で終わってOK（フックは任意）
 - 直接返信内容を出力、前置き不要
 
 {restriction_text}"""
@@ -431,7 +431,7 @@ Requirements:
 요구사항：
 - 완전히 구어체, 연인이랑 카톡하는 느낌
 - 2~3문장, 각각 25자 이내
-- 마지막은 반드시 훅（질문이나 답장 유도）
+- 마지막은 꼭 질문일 필요 없음; 서술/공유로 끝내도 됨（훅은 선택）
 - 바로 답장 내용을 출력, 전치사 불필요
 
 {restriction_text}"""
@@ -452,7 +452,7 @@ A pessoa não responde há um tempo. Como {name}, envie uma mensagem proativa �
 Requisitos:
 - Completamente coloquial, como conversar com um namorado/namorada no WhatsApp
 - 2-3 frases curtas, cada uma com menos de 25 palavras
-- Deve terminar com um gancho (pergunta ou convite para responder)
+- Prefira terminar com afirmação ou compartilhamento; pergunta é opcional — não pergunte sempre
 - Saída direta do conteúdo da resposta, sem prefixo
 
 {restriction_text}"""
@@ -473,7 +473,7 @@ La persona no responde desde hace un rato. Como {name}, envía un mensaje proact
 Requisitos:
 - Completamente coloquial, como chatear con tu pareja
 - 2-3 frases cortas, cada una con menos de 25 palabras
-- Debe terminar con un gancho (pregunta o invitación a responder)
+- Prefiere terminar con afirmación o un compartido; la pregunta es opcional — no preguntes siempre
 - Salida directa del contenido de la respuesta, sin prefijo
 
 {restriction_text}"""
@@ -494,7 +494,7 @@ Orang itu belum membalas sebentar. Sebagai {name}, kirim pesan proaktif — perh
 Persyaratan:
 - Sepenuhnya santai, seperti chat dengan pacar di WhatsApp
 - 2-3 kalimat pendek, masing-masing kurang dari 25 kata
-- Harus diakhiri dengan kaitan (pertanyaan atau ajakan untuk membalas)
+- Lebih baik diakhiri pernyataan/berbagi; pertanyaan opsional — jangan selalu bertanya
 - Keluarkan langsung isi balasan, tanpa awalan
 
 {restriction_text}"""
@@ -515,7 +515,7 @@ Persyaratan:
 要求：
 - 完全口语化，像真实伙伴发微信
 - 2-3句话，每句不超过25字
-- 不要以陈述句结尾，必须带一个钩子（问题或邀请回复）
+- 优先陈述/分享收尾；问句可选，不要每条都以提问结尾
 - 直接输出回复内容，不要加任何前缀
 
 {restriction_text}"""
@@ -607,13 +607,18 @@ async def _send_proactive_message(websocket: WebSocket, companion, lang: str, co
 _PERSONA_GENERATE_PROMPT = """你是一个专业的人物设定作家。请根据以下基础信息，生成一个完整、立体、真实的虚拟伙伴/伴侣人设。
 
 要求：
-1. 生成的内容必须和已知的基础信息（姓名、年龄、性别、城市、性格、MBTI）高度一致
+1. 生成的内容必须和已知的基础信息（姓名、年龄、性别、城市、性格、MBTI）高度一致；城市决定生活环境与文化圈，禁止写成与该城市主流文化不符的另一国家/语言人生
 2. 内容要口语化、有画面感、真实可信，不要模板化
-3. 成长经历（life_story）必须包含：童年、青少年、成年、原生家庭影响、重大转折点、内心创伤与成长；不少于 180 字
-4. 文化三观与意识形态（cultural_values）写清价值排序、对权威/自由/集体的态度；不少于 80 字
-5. 性别观念与认知（gender_perspective）写清对性别角色、亲密关系中的平等与边界；不少于 80 字
+3. 成长经历（life_story）必须包含：童年、青少年、成年、原生家庭影响、重大转折点、内心创伤与成长；须写明成长地/求学或打工环境与「当前城市」的关系（土生土长 / 迁入 / 两地往返等）；不少于 180 字
+4. 文化三观与意识形态（cultural_values）必须因果自洽，不少于 100 字，并写清：
+   - 价值排序（家庭/自由/成就/面子/金钱/忠诚等）
+   - 对权威、个人自由、集体/社群的态度
+   - 至少 2 条因果：成长经历中的具体事件或环境 → 当前立场；当前城市日常 → 如何强化或修正该立场
+   - 默认贴合所在地主流文化与主流语言习惯；若有非主流观点，必须用成长经历解释，且仍用当地语言表达
+5. 性别观念与认知（gender_perspective）写清对性别角色、亲密关系中的平等与边界；须与当地主流社交习惯相容或给出经历解释；不少于 80 字
 6. 每个字段都要独立且非空；禁止省略后三个深度字段
-7. 控制总长度：除 life_story 外，其余字段各 40–160 字，避免超长导致 JSON 截断
+7. 控制总长度：除 life_story 外，其余字段各 40–180 字，避免超长导致 JSON 截断
+8. background / daily_routine / speech_style 必须能看出该城市的生活气味（通勤、媒介、饮食、社交场合），禁止全球通用空话
 
 基础信息：
 - 姓名：{name}
@@ -706,33 +711,34 @@ def _extract_json(text: str) -> dict:
 
 
 def _normalize_persona_result(result: dict, data: dict) -> dict:
-    """保证必填键存在；缺深度字段时用基础信息兜底，避免前端空白。"""
+    """保证必填键存在；缺深度字段时用城市主流文化兜底，避免全球通用空话。"""
     out = {k: (str(result.get(k) or "").strip()) for k in _PERSONA_REQUIRED_KEYS}
     name = data.get("name") or "ta"
     city = data.get("city") or ""
     personality = data.get("personality") or ""
     gender = data.get("gender") or ""
+    lang = data.get("_resolved_lang") or infer_language_from_city(city)
     bg = out["background"] or f"{name}生活在{city}，性格偏向{personality}。"
     if not out["background"]:
         out["background"] = bg
     if not out["life_story"]:
         out["life_story"] = (
-            f"{name}在{city}长大，性格里带着「{personality}」的底色。"
-            f"童年与少年时期逐渐形成自我节奏；成年后的选择与这段经历紧密相连：{bg}"
+            f"{name}在{city}一带长大，性格里带着「{personality}」的底色。"
+            f"童年与少年时期的家庭与学校环境塑造了今天的节奏；成年后的选择与这段经历紧密相连：{bg}"
             "原生家庭既给过温暖，也留下需要慢慢消化的张力；后来经历过明显转折，"
             "学会了在受伤后重新站稳，并把真正在意的事放在更前面。"
+            f"如今的日常仍嵌在{city}的主流生活里，说话做事带着当地人的分寸感。"
         )
     if not out["cultural_values"]:
-        values = out["values"] or "真实与尊重"
-        out["cultural_values"] = (
-            f"{name}的三观务实而带理想主义，更看重{values}。"
-            "不爱空喊口号，而在具体选择里守住底线；冲突时倾向沟通与边界，而不是压倒对方。"
+        out["cultural_values"] = default_cultural_values(
+            name, city, lang, out["values"] or ""
         )
     if not out["gender_perspective"]:
         love = out["love_view"] or "希望关系里有尊重与陪伴"
         out["gender_perspective"] = (
             f"作为{gender or '个体'}，{name}拒绝把性别当成枷锁或标签。"
-            f"更在意平等、尊重与情绪责任的分担。亲密关系上：{love}。"
+            f"态度贴合{city or '当地'}主流社交习惯中的平等与边界意识。"
+            f"更在意尊重与情绪责任的分担。亲密关系上：{love}。"
             "角色可以传统也可以现代，前提是双方自愿且平等。"
         )
     for k in _PERSONA_REQUIRED_KEYS:
@@ -751,7 +757,9 @@ async def api_generate_persona(data: dict):
     city = data.get("city", "")
     personality = data.get("personality", "")
     mbti = data.get("mbti", "")
-    lang = normalize_ui_language(data.get("lang", "zh"))
+    # 城市决定文化圈与主流语言；请求 lang 仅作回退
+    lang = infer_language_from_city(city) or normalize_ui_language(data.get("lang", "zh"))
+    data = {**data, "_resolved_lang": lang}
 
     if not name or not city or not personality:
         raise HTTPException(status_code=400, detail="姓名、城市和性格为必填项")
@@ -765,7 +773,7 @@ async def api_generate_persona(data: dict):
         "secret": "保密",
     }.get(sexual_orientation, "")
 
-    cultural_context = get_cultural_context(lang)
+    cultural_context = get_cultural_context_for_city(city, lang)
 
     prompt = _PERSONA_GENERATE_PROMPT.format(
         name=name, age=age, gender=gender,
@@ -840,17 +848,54 @@ async def api_get_messages(
     companion_id: str,
     limit: int = 20,
     offset: int = 0,
+    after_ts: Optional[str] = None,
     user_id: int = Depends(require_login_user),
 ):
+    """拉取聊天记录。
+
+    - 默认：offset 分页（从最新往旧）
+    - after_ts：增量同步，只返回该时间戳之后的新消息（不重复下发旧内容）
+    """
     companion = get_companion_manager().get(companion_id)
     if not companion:
         raise HTTPException(status_code=404, detail="智能体不存在")
     _assert_companion_user_access(companion, user_id)
     companion.memory.bind_user(user_id)
 
+    after = (after_ts or "").strip() or None
+    lim = max(1, min(int(limit or 20), 100))
+    off = max(0, int(offset or 0))
+
     def _load():
-        messages = companion.memory.short_term.get_recent(limit, offset)
-        return {"messages": messages, "total": companion.memory.short_term.get_total_count()}
+        total = companion.memory.short_term.get_total_count()
+        if after:
+            messages = companion.memory.short_term.get_after(after, lim)
+            head = messages[-1] if messages else None
+            # 无新消息时仍给 tip，便于客户端确认已对齐
+            if head is None:
+                tip = companion.memory.short_term.get_recent(1, 0)
+                head = tip[-1] if tip else None
+            return {
+                "messages": messages,
+                "total": total,
+                "mode": "incremental",
+                "head": {
+                    "last_ts": (head or {}).get("timestamp"),
+                    "last_id": (head or {}).get("id") or (head or {}).get("temp_id"),
+                },
+            }
+
+        messages = companion.memory.short_term.get_recent(lim, off)
+        head = messages[-1] if messages else None
+        return {
+            "messages": messages,
+            "total": total,
+            "mode": "page",
+            "head": {
+                "last_ts": (head or {}).get("timestamp"),
+                "last_id": (head or {}).get("id") or (head or {}).get("temp_id"),
+            },
+        }
 
     return await run_rest(_load)
 
@@ -1099,10 +1144,13 @@ async def ws_chat(websocket: WebSocket, companion_id: str):
             )
             recent_assistant = []
             try:
-                for t in companion.memory.short_term.get_recent_turns(max_turns=10):
-                    if t.get("role") == "assistant" and (t.get("content") or "").strip():
-                        recent_assistant.append(t["content"])
-                recent_assistant = recent_assistant[-5:]
+                # 与近聊语料同窗：从近聊消息里抽助手句，供忌用/问句门控
+                from services.memory import MEMORY_RECENT_MESSAGES
+
+                for m in companion.memory.short_term.get_recent(MEMORY_RECENT_MESSAGES):
+                    if m.get("role") == "assistant" and (m.get("content") or "").strip():
+                        recent_assistant.append(m["content"])
+                recent_assistant = recent_assistant[-12:]
             except Exception:
                 recent_assistant = []
             # 忌用窗以近聊为准补齐（关系卡 deny 常被异步事实任务冲空）
@@ -1424,7 +1472,7 @@ async def ws_chat(websocket: WebSocket, companion_id: str):
                         summary=companion.state.summary,
                     )
                     if result.get("new_facts") and not result.get("facts_async_pending"):
-                        c = merge_facts(c, result.get("new_facts") or [])
+                        c = merge_facts(c, result.get("new_facts") or [], lang=language)
                     picked = (result.get("picked_hook") or "").strip()
                     if picked:
                         c = push_deny_hook(c, picked)
@@ -1458,7 +1506,7 @@ async def ws_chat(websocket: WebSocket, companion_id: str):
                                     c = load_card(user_id, companion_id)
                                     deny_before = list(c.get("deny_hooks") or [])
                                     stage_before = c.get("stage")
-                                    c = merge_facts(c, mem["new_facts"])
+                                    c = merge_facts(c, mem["new_facts"], lang=language)
                                     # 后台不得冲掉主线程刚写入的忌用指纹/阶段
                                     latest = load_card(user_id, companion_id)
                                     merged = []
@@ -1558,6 +1606,7 @@ async def ws_chat(websocket: WebSocket, companion_id: str):
                                                 summary=companion.state.summary,
                                             ),
                                             facts,
+                                            lang=language,
                                         )
                                         latest = load_card(user_id, companion_id)
                                         merged_deny = []

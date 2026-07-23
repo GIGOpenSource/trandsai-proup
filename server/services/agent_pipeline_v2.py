@@ -29,7 +29,7 @@ from services.knowledge_base import knowledge_base
 logger = logging.getLogger(__name__)
 
 _PREPARE_MAX_TOKENS = int(os.getenv("PREPARE_MAX_TOKENS", "512"))
-_PREPARE_MEMORY_CHARS = int(os.getenv("PREPARE_MEMORY_CHARS", "1400"))
+_PREPARE_MEMORY_CHARS = int(os.getenv("PREPARE_MEMORY_CHARS", "2200"))
 
 _PREPARE_JSON_HINT = """先理解用户本轮话，再严格输出 JSON（无 markdown 围栏）：
 {"user_intent":"用户想表达/想得到什么（一句话）","must_answer":"回复必须直接回应的点（多项用分号；无则空）","refs":"本轮指代/承接的上文对象（无则空）","think":"结合近聊的理解要点，≤280字","flirt_move":"本轮可用的轻撩/绿茶手法标签（如：具体夸/推拉/轻吃醋/装无辜/鉴定；多数轮次选1个或空）","mood":"情绪词","affection_signal":"up|flat|down","creative_hint":"可选；多数轮次用空字符串；勿强制钩子"}
@@ -228,13 +228,18 @@ def run_pipeline_v2(
         recent_assistant=recent_assistant or [],
         deny_hooks=deny_hooks or [],
         has_leave_intent=has_leave_intent,
+        affection=new_affection,
+        language=lang,
     )
     rules_block = qhints["rules_block"]
     repeat_hint = qhints["repeat_hint"]
     leave_hint = qhints["leave_hint"]
     reply_shape = qhints["reply_shape"]
+    from services.dialogue_i18n import respond_ui
+
+    ui = respond_ui(lang)
     threads = [str(x).strip() for x in (open_threads or []) if str(x).strip()][:3]
-    thread_hint = ("【未完话题】" + " / ".join(threads)) if threads else ""
+    thread_hint = (ui["open_threads"] + " / ".join(threads)) if threads else ""
 
     intent = (prep_json.get("user_intent") or "").strip()
     must_answer = (prep_json.get("must_answer") or "").strip()
@@ -242,48 +247,49 @@ def run_pipeline_v2(
     intent_block = "\n".join(
         x
         for x in (
-            f"【用户意图】{intent}" if intent else "",
-            f"【必须回应】{must_answer}" if must_answer else "",
-            f"【指代/承接】{refs}" if refs else "",
+            f"{ui['user_intent']}{intent}" if intent else "",
+            f"{ui['must_answer']}{must_answer}" if must_answer else "",
+            f"{ui['refs']}{refs}" if refs else "",
         )
         if x
     )
 
+    mood_aff = ui["mood_aff"].format(mood=mood, affection=new_affection)
+    state_line = ui["state"].format(mood=mood, affection=new_affection)
+    creative = prep_json.get("creative_hint", "") or ui["creative_empty"]
+    flirt = prep_json.get("flirt_move") or ui["flirt_default"]
     respond_system = f"""{full_prompt}{time_info}
 
 {intent_block}
-【理解要点】{prep_json.get('think', '')}
-【本轮撩法】{prep_json.get('flirt_move') or '按阶段自然带一点；勿盖过必答点'}
-【情绪】{mood} | 亲密度：{new_affection}
-【创意提示】{prep_json.get('creative_hint', '') or '（无；勿硬加钩子）'}
+{ui['think']}{prep_json.get('think', '')}
+{ui['flirt']}{flirt}
+{mood_aff}
+{ui['creative']}{creative}
 {stage_hint}
 {rules_block}
 {repeat_hint}
 {leave_hint}
 {thread_hint}
 
-【记忆上下文】
+{ui['memory']}
 {memory_text}
 
 {kb_text}
 
-【当前状态】情绪：{mood} | 亲密度：{new_affection}
+{state_line}
 
 {restriction_text}
 
-回复原则：
-1. 先准确回应用户意图与「必须回应」点，再做人设润色；禁止答非所问、禁止忽略指代。
-2. 表达要通顺：一句一事、主谓清楚、因果顺序正确；口语可以短，但不要残句乱跳、同义反复凑字。
-3. 会撩/绿茶：在接住话题后加一点张力（推拉、轻吃醋、假装无辜），随关系阶段调节；禁止术语课本腔。
-4. 钩子可选；严格遵守上方【勿复读】【忌用】【聊天规则】；禁止同义换皮/同构骨架复读。
+{ui['principles']}
 {reply_shape}"""
 
     respond_human = enrich_human_prompt(
-        f"用户刚刚说：{user_input}\n\n"
-        f"请以 {name} 的身份直接输出对用户可见的口语回复正文。"
-        "要求语句通顺、指代清楚、先答其意；禁止复述近几轮自己说过的话。",
+        ui["human_said"].format(user_input=user_input)
+        + ui["human_ask"].format(name=name),
         user_input=user_input or "",
         has_leave_intent=has_leave_intent,
+        affection=new_affection,
+        language=lang,
     )
 
     max_tok = resolve_max_tokens(new_affection)
@@ -308,7 +314,9 @@ def run_pipeline_v2(
             has_leave_intent=has_leave_intent,
         )
         if diag["need_rewrite"]:
-            rewrite_human = respond_human + rewrite_instruction(diag["ban_summary"])
+            rewrite_human = respond_human + rewrite_instruction(
+                diag["ban_summary"], affection=new_affection, language=lang
+            )
             resp3 = llm_invoke(
                 llm2,
                 [SystemMessage(content=respond_system), HumanMessage(content=rewrite_human)],
@@ -329,7 +337,10 @@ def run_pipeline_v2(
                 )
                 if diag2["need_rewrite"]:
                     rewrite_human2 = respond_human + rewrite_instruction(
-                        diag2["ban_summary"], final_pass=True
+                        diag2["ban_summary"],
+                        final_pass=True,
+                        affection=new_affection,
+                        language=lang,
                     )
                     resp4 = llm_invoke(
                         llm2,

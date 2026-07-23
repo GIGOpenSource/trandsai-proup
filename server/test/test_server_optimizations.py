@@ -30,6 +30,9 @@ class TestMemoryTier(unittest.TestCase):
         mem.short_term.get_recent_turns.return_value = [
             {"role": "user", "content": "hello"},
         ]
+        mem.short_term.get_recent.return_value = [
+            {"role": "user", "content": "hello"},
+        ]
         mem.facts = MagicMock()
         mem.facts.get_facts.return_value = ["likes coffee"]
         mem.summary = MagicMock()
@@ -82,11 +85,12 @@ class TestMemoryDialogueReserve(unittest.TestCase):
 
         mem = CompanionMemory.__new__(CompanionMemory)
         mem.short_term = MagicMock()
-        mem.short_term.get_recent_turns.return_value = [
+        mem.short_term.get_recent.return_value = [
             {"role": "user", "content": "那个你怎么看"},
             {"role": "assistant", "content": "哪个？"},
             {"role": "user", "content": "昨天说的方案啊"},
         ]
+        mem.short_term.get_recent_turns.return_value = []
         mem.facts = MagicMock()
         mem.facts.get_facts.return_value = ["likes coffee"]
         mem.summary = MagicMock()
@@ -106,6 +110,91 @@ class TestMemoryDialogueReserve(unittest.TestCase):
         )
         self.assertIn("【最近对话】", out)
         self.assertIn("昨天说的方案", out)
+        mem.short_term.get_recent.assert_called()
+        from services.memory import MEMORY_RECENT_MESSAGES
+
+        self.assertEqual(mem.short_term.get_recent.call_args[0][0], MEMORY_RECENT_MESSAGES)
+
+    def test_loads_recent_window_messages(self):
+        from unittest.mock import MagicMock
+        from services.memory import CompanionMemory, MEMORY_RECENT_MESSAGES
+
+        mem = CompanionMemory.__new__(CompanionMemory)
+        mem.short_term = MagicMock()
+        msgs = [
+            {
+                "role": "user" if i % 2 == 0 else "assistant",
+                "content": f"msg-{i}",
+            }
+            for i in range(MEMORY_RECENT_MESSAGES)
+        ]
+        mem.short_term.get_recent.return_value = msgs
+        mem.facts = MagicMock()
+        mem.facts.get_facts.return_value = []
+        mem.summary = MagicMock()
+        mem.summary.get_summary.return_value = ""
+        mem.get_context = lambda query="", user_id=None: {
+            "recent_dialogue": msgs,
+            "episodes": [],
+            "facts": [],
+            "summary": "",
+            "_short_term": mem.short_term,
+        }
+        out = mem.build_prompt_context(tier="full", max_chars=8000)
+        self.assertIn("【最近对话】", out)
+        self.assertIn("msg-0", out)
+        self.assertIn(f"msg-{MEMORY_RECENT_MESSAGES - 1}", out)
+        mem.short_term.get_recent.assert_called_with(MEMORY_RECENT_MESSAGES)
+
+    def test_under_window_uses_actual_over_caps(self):
+        """不足窗口用实际条数；超过则只保留最近 MEMORY_RECENT_MESSAGES。"""
+        from unittest.mock import MagicMock
+        from services.memory import CompanionMemory, MEMORY_RECENT_MESSAGES
+
+        def _build(msgs):
+            mem = CompanionMemory.__new__(CompanionMemory)
+            mem.short_term = MagicMock()
+            mem.short_term.get_recent.return_value = msgs
+            mem.facts = MagicMock()
+            mem.facts.get_facts.return_value = []
+            mem.summary = MagicMock()
+            mem.summary.get_summary.return_value = ""
+            mem.get_context = lambda query="", user_id=None: {
+                "recent_dialogue": msgs,
+                "episodes": [],
+                "facts": [],
+                "summary": "",
+                "_short_term": mem.short_term,
+            }
+            return mem.build_prompt_context(tier="full", max_chars=12000)
+
+        short = [
+            {"role": "user", "content": f"s-{i}"} for i in range(12)
+        ]
+        out_short = _build(short)
+        self.assertIn("s-0", out_short)
+        self.assertIn("s-11", out_short)
+        self.assertEqual(out_short.count("\n他：") + out_short.count("\n你："), 12)
+
+        long = [
+            {
+                "role": "user" if i % 2 == 0 else "assistant",
+                "content": f"L-{i}",
+            }
+            for i in range(80)
+        ]
+        out_long = _build(long)
+        keep_from = 80 - MEMORY_RECENT_MESSAGES
+        self.assertNotIn("L-0", out_long)
+        if keep_from > 0:
+            self.assertNotIn(f"L-{keep_from - 1}", out_long)
+        self.assertIn(f"L-{keep_from}", out_long)
+        self.assertIn("L-79", out_long)
+        # 80 条截成最近 MEMORY_RECENT_MESSAGES
+        self.assertEqual(
+            out_long.count("\n他：") + out_long.count("\n你："),
+            MEMORY_RECENT_MESSAGES,
+        )
 
 
 class TestRateLimit(unittest.TestCase):
@@ -643,6 +732,63 @@ class TestPhase2HooksAndStage(unittest.TestCase):
         )
         self.assertTrue(diag["need_rewrite"])
         self.assertTrue(diag["user_tease"] and diag["escape_safe"])
+        diag2 = diagnose_reply_violations(
+            "嘻嘻那我来哄哄你呀~现在在干嘛呢？",
+            user_input="当然，所以你要怎么做哦",
+            recent_assistant=["你今晚在干嘛呀~", "嘻嘻~加班啊，累不累呀？"],
+        )
+        self.assertTrue(diag2["need_rewrite"])
+        self.assertTrue(diag2.get("action_miss") or "在干嘛" in diag2["ban_summary"])
+        # 陈述/问句轮换：近两轮问句收尾后再问 → 强制改写
+        from services.dialogue_phase2 import question_spam_hits
+
+        self.assertIn(
+            "问句连发",
+            question_spam_hits(
+                "那你今晚想吃什么呀？",
+                ["今天好累呀你呢？", "加班啊累不累？"],
+            ),
+        )
+        diag_q = diagnose_reply_violations(
+            "那你今晚想吃什么呀？",
+            user_input="嗯",
+            recent_assistant=["今天好累呀你呢？", "加班啊累不累？"],
+        )
+        self.assertTrue(diag_q["need_rewrite"])
+
+        # 换皮复读：同主题换说法（Jaccard 低，但共享「这些小事/说出来」）
+        from services.eval_probes import probe_leitmotif_repeat
+
+        self.assertTrue(
+            probe_leitmotif_repeat(
+                "你别这么想啊，你可不只是懂我而已，你让我觉得这些小事值得说出来，这感觉挺不一样的。",
+                [
+                    "不是啦，你可不止是懂而已。你让我想把这些小事说出来，这感觉挺特别的。",
+                ],
+            )
+        )
+        diag_echo = diagnose_reply_violations(
+            "你可能在担心自己不特别吧，其实你挺特别的，能让我想把这些小事说出来就很安心。",
+            user_input="哦...这样啊。。。",
+            recent_assistant=[
+                "因为你说话总能让我觉得被懂啊，所以想把这些小事告诉你才安心呀。",
+                "不是啦，你可不止是懂而已。你让我想把这些小事说出来，这感觉挺特别的。",
+                "你别这么想啊，你可不只是懂我而已，你让我觉得这些小事值得说出来，这感觉挺不一样的。",
+            ],
+        )
+        self.assertTrue(diag_echo["need_rewrite"])
+        self.assertTrue(diag_echo["near_duplicate"])
+        self.assertTrue(diag_q.get("question_hits"))
+        rules_q = chat_rules_block(
+            user_input="嗯",
+            recent_assistant=["加班啊累不累？"],
+        )
+        self.assertIn("陈述句", rules_q)
+        self.assertIn("问句收尾", rules_q)
+        # 陈述收尾不触发问句门控
+        self.assertFalse(
+            question_spam_hits("我在看电视呢。", ["今天好累呀你呢？", "加班啊累不累？"])
+        )
         self.assertEqual(
             filter_fact_language(["他加班", "그는 야근"], "我加班了", "zh"),
             ["他加班"],
@@ -702,10 +848,23 @@ class TestMotiveLayer(unittest.TestCase):
     def test_content_restriction_off_by_default(self):
         from services.agent_utils import get_content_restriction
         from services.motive_layer import content_restriction_enabled
+        from services.agent_prompts import adult_intimacy_guidance
 
         self.assertFalse(content_restriction_enabled())
-        self.assertEqual(get_content_restriction("zh", 10), "")
-        self.assertEqual(get_content_restriction("zh", 100), "")
+        # 默认 off：注入随亲密度升高的成人接受度指引（非空）
+        low = get_content_restriction("zh", 10)
+        mid = get_content_restriction("zh", 40)
+        high = get_content_restriction("zh", 90)
+        self.assertIn("成人对话档", low)
+        self.assertIn("试探", low)
+        self.assertIn("暧昧接受", mid)
+        self.assertIn("高亲密", high)
+        self.assertIn("法律底线", high)
+        self.assertIn("成人对话档 · 明显迎合", adult_intimacy_guidance("zh", 60))
+        rules_hi = __import__(
+            "services.dialogue_phase2", fromlist=["chat_rules_block"]
+        ).chat_rules_block(user_input="我喜欢你的大胸", affection=70)
+        self.assertIn("高接受", rules_hi)
 
     def test_extreme_hard_vote(self):
         import services.motive_layer as ml
@@ -742,6 +901,160 @@ class TestMotiveLayer(unittest.TestCase):
         self.assertIn("motive_block", agent)
         self.assertIn("means_mode", agent)
         self.assertIn("evaluate_turn_motive", agent)
+
+
+class TestMultilingualDialogueParity(unittest.TestCase):
+    """以中文为基准补全七语对话能力。"""
+
+    def test_stage_all_langs(self):
+        from services.dialogue_phase2 import stage_instruction
+
+        for lang in ("zh", "en", "ja", "ko", "pt", "es", "id"):
+            text = stage_instruction("intimate", lang)
+            self.assertTrue(len(text) > 20, lang)
+            if lang == "zh":
+                self.assertIn("亲密", text)
+            else:
+                self.assertNotIn("【关系阶段：亲密】", text)
+
+    def test_output_rule_understands_chinese_input(self):
+        from services.agent_utils import build_system_prompt
+        from services.eval_probes import probe_chinese_input_understood
+
+        profile = {
+            "id": "t",
+            "name": "Ava",
+            "gender": "女",
+            "personality": "warm",
+            "background": "x",
+            "speech_style": "soft",
+        }
+        for lang in ("zh", "en", "ja", "ko", "pt", "es", "id"):
+            prompt = build_system_prompt(profile, language=lang, turns=3)
+            self.assertTrue(
+                probe_chinese_input_understood(prompt, lang),
+                f"missing input-understanding for {lang}",
+            )
+
+    def test_user_gender_desc_no_zh_fallback(self):
+        from services.agent_utils import build_system_prompt
+
+        profile = {
+            "id": "t",
+            "name": "Lia",
+            "gender": "女",
+            "personality": "warm",
+            "background": "x",
+            "speech_style": "soft",
+        }
+        for lang in ("pt", "es", "id"):
+            prompt = build_system_prompt(
+                profile, language=lang, user_gender="male", turns=2
+            )
+            self.assertNotIn("男生", prompt)
+
+    def test_quality_hints_localized(self):
+        from services.dialogue_quality import build_respond_quality_hints
+
+        zh = build_respond_quality_hints(
+            user_input="好的晚安", has_leave_intent=True, language="zh"
+        )
+        en = build_respond_quality_hints(
+            user_input="good night", has_leave_intent=True, language="en"
+        )
+        self.assertIn("离开硬收束", zh["leave_hint"])
+        self.assertIn("Hard leave close", en["leave_hint"])
+        self.assertIn("本轮聊天规则", zh["rules_block"])
+        self.assertIn("Chat rules this turn", en["rules_block"])
+
+    def test_quality_configs_are_independent(self):
+        from services.dialogue_i18n import quality_ui
+
+        ja = quality_ui("ja")
+        ko = quality_ui("ko")
+        pt = quality_ui("pt")
+        es = quality_ui("es")
+        idn = quality_ui("id")
+        en = quality_ui("en")
+        self.assertIn("このターン", ja["rules_title"])
+        self.assertIn("이번 턴", ko["rules_title"])
+        self.assertIn("Regras", pt["rules_title"])
+        self.assertIn("Reglas", es["rules_title"])
+        self.assertIn("Aturan", idn["rules_title"])
+        self.assertNotEqual(ja["rules_title"], en["rules_title"])
+        self.assertNotEqual(ko["rules_title"], en["rules_title"])
+        self.assertNotEqual(pt["rules_title"], en["rules_title"])
+        self.assertNotEqual(es["rules_title"], en["rules_title"])
+        self.assertNotEqual(idn["rules_title"], en["rules_title"])
+
+    def test_merge_facts_keeps_hangul_for_ko(self):
+        from services.relation_card import merge_facts
+
+        zh_card = merge_facts({}, ["그는 야근"], lang="zh")
+        self.assertEqual(zh_card.get("facts") or [], [])
+        ko_card = merge_facts({}, ["그는 야근"], lang="ko")
+        self.assertIn("그는 야근", ko_card.get("facts") or [])
+
+    def test_tease_detection_multilingual(self):
+        from services.dialogue_phase2 import is_user_tease
+
+        self.assertTrue(is_user_tease("我喜欢你的胸"))
+        self.assertTrue(is_user_tease("you're so sexy"))
+        self.assertTrue(is_user_tease("おっぱい触って"))
+
+
+class TestIdeologyLocaleAlignment(unittest.TestCase):
+    """意识形态须符合成长经历、生活环境与所在地主流文化/语言。"""
+
+    def test_city_locale_and_context(self):
+        from services.culture_data import (
+            resolve_locale,
+            get_cultural_context_for_city,
+            infer_language_from_city,
+            default_cultural_values,
+        )
+
+        self.assertEqual(infer_language_from_city("東京"), "ja")
+        loc = resolve_locale("東京")
+        self.assertEqual(loc["lang"], "ja")
+        self.assertIn("遠慮", loc["ideology"])
+        ctx = get_cultural_context_for_city("東京", "ja")
+        self.assertIn("主流文化锚点", ctx)
+        self.assertIn("因果", ctx)
+        cv = default_cultural_values("美咲", "東京", "ja", "誠実")
+        self.assertIn("東京", cv)
+        self.assertNotIn("务实而带理想主义", cv)
+
+    def test_runtime_prompt_has_ideology_rule(self):
+        from services.agent_utils import build_system_prompt
+
+        profile = {
+            "id": "t",
+            "name": "美咲",
+            "age": 24,
+            "gender": "女",
+            "city": "東京",
+            "personality": "温柔",
+            "background": "在东京长大",
+            "speech_style": "柔和",
+            "life_story": "童年在东京，家庭重视礼节。",
+            "cultural_values": "重视察し与阶段关系。",
+            "gender_perspective": "平等尊重",
+        }
+        prompt = build_system_prompt(profile, language="zh", turns=2)
+        self.assertIn("意识形态一致性", prompt)
+        self.assertIn("東京", prompt)
+        self.assertIn("文化三观", prompt)
+
+    def test_normalize_fallback_uses_city_mainstream(self):
+        from api.companions import _normalize_persona_result
+
+        out = _normalize_persona_result(
+            {},
+            {"name": "Ava", "city": "London", "personality": "warm", "_resolved_lang": "en"},
+        )
+        self.assertIn("London", out["cultural_values"])
+        self.assertNotIn("务实而带理想主义", out["cultural_values"])
 
 
 if __name__ == "__main__":

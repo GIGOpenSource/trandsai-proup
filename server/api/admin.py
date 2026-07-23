@@ -1092,11 +1092,12 @@ _BATCH_PERSONA_PROMPT = """你是一个专业的人物设定作家。请根据�
 要求（必须严格遵守，确保地区、语言与上表基础信息高度一致）：
 1. 每个角色的内容必须和其基础信息（姓名、年龄、性别、城市、性格、MBTI）高度一致，不得写成与**城市/姓名文化圈**不符的海外架空背景，除非上表能支撑
 2. 内容要口语化、有画面感、真实可信、生动具体，不要模板化或泛泛而谈
-3. 成长经历（life_story）必须包含：童年、青少年、成年、原生家庭影响、重大转折点、具体事件
-4. **所有字段必须完整填充**，不能为空、占位符或过短，必须达到括号指定的字数，使用丰富细节、个人故事、具体例子使人物立体有血有肉
-5. 输出语言与内容一致性（极其重要，违反则视为错误输出）：
+3. 成长经历（life_story）必须包含：童年、青少年、成年、原生家庭影响、重大转折点、具体事件；并写明与当前城市的关系（土生土长/迁入等）
+4. 文化三观（cultural_values）必须因果自洽：成长经历事件 → 当前立场；当前城市主流文化/语言 → 如何强化该立场；默认贴合当地主流，非主流须用经历解释
+5. **所有字段必须完整填充**，不能为空、占位符或过短，必须达到括号指定的字数，使用丰富细节、个人故事、具体例子使人物立体有血有肉
+6. 输出语言与内容一致性（极其重要，违反则视为错误输出）：
 {output_instruction}
-6. JSON 必须有效，每个字段都是独立、连贯的段落文本
+7. JSON 必须有效，每个字段都是独立、连贯的段落文本
 
 {locale_banner}
 
@@ -1168,7 +1169,11 @@ async def _batch_generate_companions_core(data: dict):
     # 生成基础属性（姓名/城市/性格与 lang 同文化圈一致）
     base_profiles = build_batch_profiles(lang, count, gender=gender, sexual_orientation=sexual_orientation)
 
-    cultural_context = get_cultural_context(lang)
+    cultural_context = get_cultural_context(lang) + (
+        "\n\n【意识形态强制 — 每个角色各自适用】"
+        "cultural_values / life_story / background 必须贴合该角色自己的「城市」主流文化与主流语言；"
+        "写清成长经历→立场、城市日常→如何强化；禁止用另一国家/语言圈的通用模板套到所有人。"
+    )
     output_instruction = get_batch_persona_output_instruction(lang)
     locale_banner = (
         f"【本批目标语言码 / target_language_code】{lang}\n"

@@ -104,13 +104,13 @@ _AGENT_TIMEOUT_MESSAGE = {
 }
 
 _CONNECT_MESSAGES = {
-    "zh": lambda name: f"已连接到 {name}，开始聊天吧~",
-    "en": lambda name: f"Connected to {name}. Let's chat~",
-    "ja": lambda name: f"{name}に接続しました。お話ししましょう~",
-    "ko": lambda name: f"{name}에 연결됐어. 이야기하자~",
-    "pt": lambda name: f"Conectado a {name}. Vamos conversar~",
-    "es": lambda name: f"Conectado a {name}. ¡Hablemos~!",
-    "id": lambda name: f"Terhubung dengan {name}. Mari ngobrol~",
+    "zh": lambda name: f"{name} 在线，开始聊天吧~",
+    "en": lambda name: f"{name} is online. Let's chat~",
+    "ja": lambda name: f"{name}はオンラインです。お話ししましょう~",
+    "ko": lambda name: f"{name} 온라인이야. 이야기하자~",
+    "pt": lambda name: f"{name} está online. Vamos conversar~",
+    "es": lambda name: f"{name} está en línea. ¡Hablemos~!",
+    "id": lambda name: f"{name} sedang daring. Mari ngobrol~",
 }
 
 # WebSocket 连接阶段错误（与客户端 lang 查询参数对齐）

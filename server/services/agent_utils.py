@@ -181,16 +181,21 @@ def _get_interaction_params(lang: str, ai_gender: str, user_gender: str = ""):
 
 
 def get_content_restriction(language: str, affection: float) -> str:
-    """内容限制底线：默认取消（REQ-M3）。仅 CONTENT_RESTRICTION=legacy 时恢复旧闸门。"""
+    """内容策略：
+
+    - CONTENT_RESTRICTION=legacy：旧闸门（未满 100 禁成人；满 100 迎合）
+    - 默认 off：随亲密度提升「接受并回应成人对话」档位指引（REQ-Q7）
+    """
     from services.motive_layer import content_restriction_enabled
 
-    if not content_restriction_enabled():
-        return ""
     lk = normalize_ui_language(language)
-    if affection >= 100:
-        return _FULL_INTIMACY_GUIDANCE.get(lk, _FULL_INTIMACY_GUIDANCE["zh"])
-    template = _CONTENT_RESTRICTIONS.get(lk, _CONTENT_RESTRICTIONS["zh"])
-    return template.format(affection=affection)
+    aff = float(affection or 0)
+    if content_restriction_enabled():
+        if aff >= 100:
+            return _FULL_INTIMACY_GUIDANCE.get(lk, _FULL_INTIMACY_GUIDANCE["zh"])
+        template = _CONTENT_RESTRICTIONS.get(lk, _CONTENT_RESTRICTIONS["zh"])
+        return template.format(affection=aff)
+    return adult_intimacy_guidance(lk, aff)
 
 
 _CITY_TZ_HINTS: Tuple[Tuple[str, str], ...] = (
@@ -491,6 +496,7 @@ Aturan ini menimpa deskripsi \"sangat mencintai\" atau \"kekasih intim\" apa pun
 }
 
 # 强制输出语言与用户界面一致（优先级高于人设中的地区/语言混杂描述）
+# 输入理解契约见 dialogue_i18n.input_understanding_rule（中文能力对齐：听懂任意语言输入）
 _OUTPUT_LANGUAGE_RULE: dict[str, str] = {
     "zh": "\n\n【输出语言 — 强制】你必须全程使用与用户当前 App 界面相同的语言回复（简体中文界面 → 仅用简体中文）。禁止仅凭人设地区默认用语种；禁止语言混用（除非用户明确要求双语/翻译）。",
     "en": "\n\n[OUTPUT LANGUAGE — MANDATORY] You MUST reply entirely in the same language as the user's current app UI (English UI → English only). Do not switch language based on character city alone; no code-mixing unless the user explicitly asks for translation.",
@@ -532,6 +538,8 @@ def _build_core_prompt(
     turns: int,
 ) -> str:
     """Compact system prompt for internal reasoning calls (~800 tokens)."""
+    from services.dialogue_i18n import respond_ui
+
     lang = normalize_ui_language(language)
     if lang not in _SYSTEM_PROMPTS:
         lang = "zh"
@@ -540,11 +548,24 @@ def _build_core_prompt(
     speech = profile.get("speech_style", "")[:200]
     if evolved and evolved.get("personality"):
         personality = f"{personality}\n{evolved['personality'][:150]}"
-    return (
-        f"你是{name}。性格：{personality}\n口癖/说话风格：{speech}\n"
-        f"当前对话轮次：{turns}。请用{lang}进行内心分析，输出简洁 JSON。\n"
-        "理解优先：先弄清用户本轮意图、必须回应点、指代/省略。\n"
-        "风格备忘：可会撩、可绿茶张力，但先接住用户的话；禁止答非所问。"
+    ui = respond_ui(lang)
+    return ui["core_inner"].format(
+        name=name,
+        personality=personality,
+        speech=speech,
+        turns=turns,
+        lang=lang,
+    )
+
+
+def _format_profile_ideology(profile: dict, lang: str) -> str:
+    """把文化三观包装为「成长经历+城市主流文化」一致的运行时块。"""
+    from services.culture_data import format_cultural_values_for_prompt
+
+    return format_cultural_values_for_prompt(
+        profile.get("cultural_values", "") or "",
+        lang,
+        profile.get("city", "") or "",
     )
 
 
@@ -570,14 +591,18 @@ def build_system_prompt(
     orientation_texts = _SEXUAL_ORIENTATION_TEXTS.get(lang, _SEXUAL_ORIENTATION_TEXTS["zh"])
     sexual_orientation_desc = orientation_texts.get(orientation, orientation_texts[""])
 
-    # 用户性别描述
+    # 用户性别描述（七语齐全，避免 pt/es/id 回退夹中文）
     user_gender_desc_map = {
         "zh": {"male": "男生", "female": "女生", "secret": "性别保密的人", "": "一个让你心动的人"},
         "en": {"male": "a male", "female": "a female", "secret": "someone who keeps their gender private", "": "someone who makes your heart flutter"},
         "ja": {"male": "男性", "female": "女性", "secret": "性別を秘密にしている人", "": "あなたの心を動かす人"},
         "ko": {"male": "남성", "female": "여성", "secret": "성별을 비밀로 하는 사람", "": "너의 마음을 설레게 하는 사람"},
+        "pt": {"male": "um homem", "female": "uma mulher", "secret": "alguém que mantém o gênero em segredo", "": "alguém que faz seu coração acelerar"},
+        "es": {"male": "un chico", "female": "una chica", "secret": "alguien que guarda su género en privado", "": "alguien que te hace latir el corazón"},
+        "id": {"male": "seorang pria", "female": "seorang wanita", "secret": "seseorang yang merahasiakan gendernya", "": "seseorang yang membuat hatimu berdegup"},
     }
-    user_gender_desc = user_gender_desc_map.get(lang, user_gender_desc_map["zh"]).get(user_gender, user_gender_desc_map["zh"][""])
+    ug_map = user_gender_desc_map.get(lang, user_gender_desc_map["zh"])
+    user_gender_desc = ug_map.get(user_gender, ug_map.get("", user_gender_desc_map["zh"][""]))
 
     # 优先使用智能体级配置，没有则回退到全局配置
     companion_id = profile.get("id")
@@ -586,17 +611,20 @@ def build_system_prompt(
     custom_template = cfg.get(custom_key, "")
     template = custom_template if custom_template else _SYSTEM_PROMPTS[lang]
 
+    from services.dialogue_i18n import respond_ui
+
+    evo_ui = respond_ui(lang)
     # 合并基础人格与进化增量
     personality = profile.get("personality", "")
     background = profile.get("background", "")
     speech_style = profile.get("speech_style", "")
     if evolved:
         if evolved.get("personality"):
-            personality = f"{personality}\n\n【基于对话进化的特质】{evolved['personality']}"
+            personality = f"{personality}\n\n{evo_ui['evolved_personality']}{evolved['personality']}"
         if evolved.get("background"):
-            background = f"{background}\n\n【基于对话更新的背景】{evolved['background']}"
+            background = f"{background}\n\n{evo_ui['evolved_background']}{evolved['background']}"
         if evolved.get("speech_style"):
-            speech_style = f"{speech_style}\n\n【基于对话调整的话风】{evolved['speech_style']}"
+            speech_style = f"{speech_style}\n\n{evo_ui['evolved_speech']}{evolved['speech_style']}"
 
     prompt = template.format(
         name=profile.get("name", "Babe"),
@@ -612,8 +640,8 @@ def build_system_prompt(
         daily_routine=profile.get("daily_routine", ""),
         favorite_things=profile.get("favorite_things", ""),
         mbti=profile.get("mbti", ""),
-        life_story=(profile.get("life_story", "") or "")[:400],
-        cultural_values=profile.get("cultural_values", ""),
+        life_story=(profile.get("life_story", "") or "")[:600],
+        cultural_values=_format_profile_ideology(profile, lang),
         gender_perspective=profile.get("gender_perspective", ""),
         gender_role=gender_role,
         pronoun=pronoun,
@@ -628,7 +656,10 @@ def build_system_prompt(
         override = _FIRST_TURN_OVERRIDES.get(lang, _FIRST_TURN_OVERRIDES["zh"])
         prompt = f"{override}\n\n---\n\n{prompt}"
 
+    from services.dialogue_i18n import input_understanding_rule
+
     prompt += _OUTPUT_LANGUAGE_RULE.get(lang, _OUTPUT_LANGUAGE_RULE["zh"])
+    prompt += input_understanding_rule(lang)
     prompt += _DIALOGUE_TIME_CONTEXT_RULE.get(lang, _DIALOGUE_TIME_CONTEXT_RULE["zh"])
     prompt += _PAREN_THINKING_FORMAT_RULE.get(lang, _PAREN_THINKING_FORMAT_RULE["zh"])
     return prompt

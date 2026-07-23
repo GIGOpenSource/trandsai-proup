@@ -95,16 +95,28 @@ def save_card(user_id: int, companion_id: str, card: Dict[str, Any]) -> None:
                     pass
 
 
-def merge_facts(card: Dict[str, Any], new_facts: List[str], max_items: int = 10) -> Dict[str, Any]:
+def merge_facts(
+    card: Dict[str, Any],
+    new_facts: List[str],
+    max_items: int = 10,
+    *,
+    lang: str = "",
+) -> Dict[str, Any]:
+    """合并事实。按 UI 语言门禁脚本污染（对齐中文关系卡卫生，同时允许韩文卡保留 Hangul）。"""
+    from core.i18n import normalize_ui_language
+
     out = dict(card or _empty_card())
     facts = list(out.get("facts") or [])
     seen = {str(f).strip() for f in facts}
+    lk = normalize_ui_language(lang) if lang else ""
     for f in new_facts or []:
         s = str(f).strip()
         if not s or s in seen:
             continue
-        # 丢弃韩文行，避免污染中文关系卡
-        if re.search(r"[\uac00-\ud7af]", s):
+        has_ko = bool(re.search(r"[\uac00-\ud7af]", s))
+        has_zh = bool(re.search(r"[\u4e00-\u9fff]", s))
+        # 中文卡：丢弃纯韩文污染行；韩文卡：保留 Hangul
+        if has_ko and not has_zh and lk in ("", "zh"):
             continue
         facts.append(s)
         seen.add(s)

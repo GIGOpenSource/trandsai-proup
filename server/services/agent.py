@@ -80,6 +80,8 @@ def get_llm(
 
 
     openai_extra = {}
+    # Grok/xAI 不支持 presence_penalty / frequency_penalty（会 400 invalid-argument）
+    # 仅对 OpenAI 兼容且明确支持的提供商注入
     if freq_pen:
         openai_extra["frequency_penalty"] = freq_pen
     if pres_pen:
@@ -102,13 +104,13 @@ def get_llm(
         api_key = _override_or_env("xai_key", "XAI_API_KEY")
         if not api_key:
             raise RuntimeError("请设置 XAI_API_KEY 环境变量.")
+        # grok-3-latest 拒收 presence/frequency penalty
         return ChatOpenAI(
             model="grok-3-latest",
             temperature=temperature,
             max_tokens=max_tokens,
             api_key=api_key,
             base_url="https://api.x.ai/v1",
-            **openai_extra,
         )
 
     if provider == "openai":

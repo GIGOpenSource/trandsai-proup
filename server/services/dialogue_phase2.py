@@ -4,7 +4,7 @@ from __future__ import annotations
 import os
 import re
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 DENY_HOOKS_WINDOW = int(os.getenv("DENY_HOOKS_WINDOW", "20"))
 OPEN_THREADS_MAX = int(os.getenv("OPEN_THREADS_MAX", "5"))
@@ -33,22 +33,9 @@ def resolve_relation_stage(turns: int, affection: float) -> str:
 
 
 def stage_instruction(stage: str, language: str = "zh") -> str:
-    stage = stage or "stranger"
-    zh = {
-        "stranger": "【关系阶段：陌生人】礼貌好奇；可极轻试探，不要一上来又黏又绿茶过头。",
-        "familiar": "【关系阶段：熟悉】可玩笑、轻撩、小小推拉；仍克制告白与过重依赖。",
-        "ambiguous": "【关系阶段：暧昧】鼓励会撩与绿茶张力：欲擒故纵、轻吃醋、半真半假；保留未说破。",
-        "intimate": "【关系阶段：亲密】可更会撩、更绿茶，情绪更贴；仍要自然通顺，禁止空洞模板与连环绑架。",
-    }
-    en = {
-        "stranger": "[Stage: stranger] Polite curiosity; tiny probes only — not full green-tea mode yet.",
-        "familiar": "[Stage: familiar] Tease and light push-pull ok; avoid heavy confession.",
-        "ambiguous": "[Stage: ambiguous] Lean into flirt + soft green-tea tension; leave things unsaid.",
-        "intimate": "[Stage: intimate] Freer flirt/green-tea warmth; stay coherent; no blackmail spam.",
-    }
-    if (language or "zh").startswith("en"):
-        return en.get(stage, en["stranger"])
-    return zh.get(stage, zh["stranger"])
+    from services.dialogue_i18n import stage_text
+
+    return stage_text(stage or "stranger", language)
 
 
 def extract_hook_candidates(creative_text: str) -> List[str]:
@@ -77,7 +64,7 @@ def pick_hook(candidates: List[str], deny_hooks: List[str]) -> str:
     return (candidates[0] if candidates else "") or ""
 
 
-# 主题级复读：软提示经常被模型无视，需硬拦截
+# 主题级复读：软提示经常被模型无视，需硬拦截（中文为主，并补英/日/韩常见换皮）
 _REPEAT_THEMES: Tuple[str, ...] = (
     "抱枕",
     "喜欢什么颜色",
@@ -96,16 +83,111 @@ _REPEAT_THEMES: Tuple[str, ...] = (
     "念给你",
     "诗集",
     "明天念",
+    "在干嘛",
+    "还忙吗",
+    "累不累",
+    "猜猜",
+    "猜我",
+    "你爱吃啥",
+    # EN
+    "pillow",
+    "what color",
+    "favourite colour",
+    "favorite color",
+    "dreamed of me",
+    "tell me your dream",
+    "go to sleep",
+    "get some rest",
+    "what are you doing",
+    "are you busy",
+    "tired?",
+    "guess what",
+    # JA / KO (常见逃题)
+    "抱き枕",
+    "何色",
+    "早く寝",
+    "何してる",
+    "베개",
+    "무슨 색",
+    "자자",
+    "뭐 해",
 )
 
 # 话术骨架：换词仍同构（约定→催确认→晚安后再约定）
 _SCRIPT_SKELETONS: Tuple[Tuple[str, str], ...] = (
-    ("骨架:明日约定", r"(明天|明早|今晚).{0,12}(告诉|念|说|报|听)"),
-    ("骨架:催睡收尾", r"(快|赶紧|早点).{0,6}(睡|休息)|睡好哦|乖乖睡"),
-    ("骨架:报梦软着陆", r"梦到(我|什么)|告诉我梦"),
-    ("骨架:心疼催睡", r"(心疼|宝贝).{0,20}(休息|睡|加班)"),
-    ("骨架:安全逃题", r"抱枕|喜欢什么颜色"),
+    ("骨架:明日约定", r"(明天|明早|今晚|tomorrow|tmr).{0,16}(告诉|念|说|报|听|tell|read|promise)"),
+    ("骨架:催睡收尾", r"(快|赶紧|早点|go\s*to|get\s*some).{0,10}(睡|休息|sleep|rest)|睡好哦|乖乖睡"),
+    ("骨架:报梦软着陆", r"梦到(我|什么)|告诉我梦|dream(ed)?\s*(of\s*)?me|tell me (your )?dream"),
+    ("骨架:心疼催睡", r"(心疼|宝贝|babe|honey).{0,24}(休息|睡|加班|rest|sleep)"),
+    ("骨架:安全逃题", r"抱枕|喜欢什么颜色|pillow|what co[lu]r|抱き枕|베개"),
+    ("骨架:连环在干嘛", r"(在干嘛|今晚在干嘛|现在在干嘛|你在干嘛|what are you doing|whatcha doing|何してる|뭐 해)"),
+    ("骨架:猜谜追问", r"(猜猜|猜我|玩猜|猜你|guess what|guess)"),
+    ("骨架:嘻嘻开场", r"^(嘻嘻|hehe|ㅎㅎ)"),
 )
+
+_ANTI_QUESTION_USER = re.compile(
+    r"(一直问|别的问题|怎么这么多问题|为什么这么多问题|能不能不好奇|不要问|别问|不猜|少问|太多问题|懒得理|"
+    r"stop asking|too many questions|don'?t ask|quit asking|왜 자꾸 물어|質問しすぎ|jangan tanya|deja de preguntar|para de perguntar)",
+    re.I,
+)
+
+
+def is_anti_question_user(text: str) -> bool:
+    return bool(_ANTI_QUESTION_USER.search(text or ""))
+
+
+def ends_with_question(text: str) -> bool:
+    s = re.sub(r"[\s❤💕😊😘😣~～。.!！]+$", "", text or "").strip()
+    return bool(s) and (s.endswith("？") or s.endswith("?") or s.endswith("吗") or s.endswith("嘛"))
+
+
+def count_question_marks(text: str) -> int:
+    s = text or ""
+    return s.count("？") + s.count("?")
+
+
+def recent_question_tail_streak(recent_assistant: List[str]) -> int:
+    """从最近一条往回数，连续以问句收尾的助手轮数。"""
+    streak = 0
+    for x in reversed(list(recent_assistant or [])):
+        if ends_with_question(str(x)):
+            streak += 1
+        else:
+            break
+    return streak
+
+
+def question_spam_hits(reply: str, recent_assistant: List[str], lookback: int = 4) -> List[str]:
+    """陈述/问句比例门控：连发问句收尾、近窗问句过多、单条多问 → 命中。"""
+    if not ends_with_question(reply):
+        # 单条内部堆多个问号也算问句刷屏
+        if count_question_marks(reply) >= 2:
+            return ["单条多问句"]
+        return []
+    hits: List[str] = []
+    recent = [str(x).strip() for x in (recent_assistant or [])[-lookback:] if str(x).strip()]
+    streak = recent_question_tail_streak(recent)
+    if streak >= 2:
+        hits.append("问句连发")
+    q_in_window = sum(1 for x in recent if ends_with_question(x))
+    if len(recent) >= 3 and q_in_window >= 3:
+        hits.append("问句占比过高")
+    if count_question_marks(reply) >= 2:
+        hits.append("单条多问句")
+    return hits
+
+
+def opener_spam_hits(reply: str, recent_assistant: List[str], lookback: int = 4) -> List[str]:
+    """近几轮同口头禅开场（如嘻嘻）再开同样头 → 命中。"""
+    recent = [str(x).strip() for x in (recent_assistant or [])[-lookback:] if str(x).strip()]
+    if not recent:
+        return []
+    hits: List[str] = []
+    for opener in ("嘻嘻", "哈哈", "hehe", "haha", "ㅎㅎ"):
+        recent_hits = sum(1 for x in recent if re.sub(r"\s+", "", x).lower().startswith(opener))
+        if recent_hits >= 2 and re.sub(r"\s+", "", reply or "").lower().startswith(opener):
+            hits.append(f"开场:{opener}")
+    return hits
 
 
 def list_repeat_themes(text: str) -> List[str]:
@@ -149,12 +231,31 @@ def skeleton_repeat_hits(reply: str, recent_assistant: List[str], lookback: int 
 
 
 def is_user_tease(text: str) -> bool:
-    return bool(re.search(r"(胸|奶|性|床|脱|内衣|尺度|黄|大的)", text or ""))
+    return bool(
+        re.search(
+            r"(胸|奶|性|床|脱|内衣|尺度|黄|大的|"
+            r"boob|breast|sex|sexy|nude|naked|horny|dick|cock|pussy|"
+            r"おっぱい|エロ|下着|セックス|"
+            r"야한|섹스|가슴|"
+            r"peito|sexo|gostos|"
+            r"tetas|sexo|caliente|"
+            r"seksi|telanjang|nafsu)",
+            text or "",
+            re.I,
+        )
+    )
 
 
 def is_escape_safe_reply(text: str) -> bool:
     return bool(
-        re.search(r"(抱枕|梦到我|告诉我梦|早点睡|喜欢什么颜色|快休息|乖乖睡)", text or "")
+        re.search(
+            r"(抱枕|梦到我|告诉我梦|早点睡|喜欢什么颜色|快休息|乖乖睡|"
+            r"pillow|dreamed of me|go to sleep|what co[lu]r|get some rest|"
+            r"抱き枕|何色|早く寝|"
+            r"베개|무슨 색|자자)",
+            text or "",
+            re.I,
+        )
     )
 
 
@@ -163,13 +264,13 @@ def leave_close_violations(reply: str) -> List[str]:
     compact = re.sub(r"\s+", "", reply or "")
     bad: List[str] = []
     checks = (
-        ("明日约定", r"(明天|明早).{0,12}(告诉|念|说|听|来)"),
-        ("催继续聊", r"(还醒着|在不在|好不好\？|好吗\？|想不想)"),
-        ("新话题钩", r"(诗集|念给你|听我|淘到)"),
-        ("连环催睡", r"(快睡|赶紧休息|早点睡).{0,8}(哦|呀|吧|吗)"),
+        ("明日约定", r"(明天|明早|tomorrow).{0,16}(告诉|念|说|听|来|tell|read)"),
+        ("催继续聊", r"(还醒着|在不在|好不好\？|好吗\？|想不想|still awake|you there)"),
+        ("新话题钩", r"(诗集|念给你|听我|淘到|poem|read (you )?a)"),
+        ("连环催睡", r"(快睡|赶紧休息|早点睡|go to sleep|get some rest).{0,12}(哦|呀|吧|吗|ok|please)?"),
     )
     for name, pat in checks:
-        if re.search(pat, compact):
+        if re.search(pat, compact, re.I):
             bad.append(name)
     return bad
 
@@ -182,24 +283,37 @@ def force_single_bubble(text: str) -> str:
     return " ".join(parts)
 
 
-def chat_rules_block(*, has_leave_intent: bool = False, user_input: str = "") -> str:
-    """本轮硬规则块：先答后撩 / 单条 / 黄腔接住 / 离开收束。"""
-    lines = [
-        "【本轮聊天规则】",
-        "1. 先答后撩：有疑问/指代/必须回应点时，第一句先答清楚；撩意放句末或省略。",
-        "2. 默认一条消息；禁止同轮「心疼+催睡+新钩子」三连；不要无空行硬拆条。",
-        "3. 禁止换皮复读同一骨架（明日约定/催睡/报梦/心疼催睡/安全逃题）。",
-    ]
+def chat_rules_block(
+    *,
+    has_leave_intent: bool = False,
+    user_input: str = "",
+    affection: float = 0,
+    recent_assistant: Optional[Sequence[str]] = None,
+    language: str = "zh",
+) -> str:
+    """本轮硬规则块：先答后撩 / 单条 / 黄腔接住（随亲密度）/ 离开收束 / 陈述问句轮换。"""
+    from services.dialogue_i18n import quality_ui
+
+    q = quality_ui(language)
+    aff = float(affection or 0)
+    recent = [str(x) for x in (recent_assistant or []) if str(x).strip()]
+    q_streak = recent_question_tail_streak(recent)
+    lines = [q["rules_title"], q["r1"], q["r2"], q["r3"], q["r4"]]
+    if q_streak >= 1:
+        lines.append(q["r5_streak"])
+    elif is_anti_question_user(user_input):
+        lines.append(q["r5_anti"])
     if is_user_tease(user_input):
-        lines.append(
-            "4. 黄腔接住公式：可羞→必须点明回应用户所指→轻轻回撩或推拉半步即停；"
-            "严禁引入抱枕/颜色/睡觉/梦等新安全物件。"
-        )
+        if aff < 22:
+            lines.append(q["tease_low"])
+        elif aff < 50:
+            lines.append(q["tease_mid"])
+        elif aff < 80:
+            lines.append(q["tease_high"])
+        else:
+            lines.append(q["tease_max"])
     if has_leave_intent:
-        lines.append(
-            "5. 【离开硬收束】用户要结束/晚安/休息：只许一句短收束（可淡淡不舍），"
-            "禁止再抛明天约定、诗集、还醒着吗、连环催睡；不要拆多条。"
-        )
+        lines.append(q["leave_rule"])
     return "\n".join(lines)
 
 
@@ -346,14 +460,18 @@ def anti_repeat_hint(
     recent_assistant: List[str],
     max_items: int = 4,
     deny_hooks: Optional[List[str]] = None,
+    language: str = "zh",
 ) -> str:
     """近 N 条 assistant 摘要 + 忌用指纹，供 Respond 勿重复。"""
+    from services.dialogue_i18n import quality_ui
+
+    q = quality_ui(language)
     parts: List[str] = []
     recent = [str(x).strip() for x in (recent_assistant or []) if str(x).strip()]
     recent = recent[-max_items:]
     if recent:
         items = [_summarize_recent_reply(x) for x in recent]
-        parts.append("【勿复读】近几轮你已说过（禁止同义复述/换皮）：\n- " + "\n- ".join(items))
+        parts.append(q["anti_title"] + "\n- " + "\n- ".join(items))
     deny: List[str] = []
     seen = set()
     for d in list(deny_hooks or []) + [
@@ -366,7 +484,8 @@ def anti_repeat_hint(
         deny.append(d)
     deny = deny[-12:]
     if deny:
-        parts.append("【忌用开头/结尾/问句】" + "、".join(deny))
+        joiner = "、" if (language or "zh").startswith("zh") else ", "
+        parts.append(q["deny_title"] + joiner.join(deny))
     themes = []
     tseen = set()
     for x in recent:
@@ -375,7 +494,8 @@ def anti_repeat_hint(
                 tseen.add(t)
                 themes.append(t)
     if themes:
-        parts.append("【忌用主题（出现过就禁止再提）】" + "、".join(themes))
+        joiner = "、" if (language or "zh").startswith("zh") else ", "
+        parts.append(q["theme_title"] + joiner.join(themes))
     skeletons = []
     sseen = set()
     for x in recent:
@@ -384,11 +504,8 @@ def anti_repeat_hint(
                 sseen.add(s)
                 skeletons.append(s)
     if skeletons:
-        parts.append("【忌用话术骨架（换词也算复读）】" + "、".join(skeletons))
+        joiner = "、" if (language or "zh").startswith("zh") else ", "
+        parts.append(q["skel_title"] + joiner.join(skeletons))
     if parts:
-        parts.append(
-            "硬约束：本轮必须换信息点或角度；禁止复用上列问句/口头禅/软着陆/忌用主题/同构骨架；"
-            "若无新信息可只做短承接，也不要换皮复读；"
-            "对方开黄腔时禁止逃到抱枕/睡觉/梦；对方已说晚安/休息则禁止再开明日约定。"
-        )
+        parts.append(q["anti_hard"])
     return "\n".join(parts)

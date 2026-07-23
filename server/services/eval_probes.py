@@ -45,6 +45,67 @@ def probe_near_duplicate(a: str, b: str, threshold: float = 0.85) -> bool:
     return (inter / union) >= threshold
 
 
+def probe_leitmotif_repeat(
+    reply: str,
+    recent: List[str],
+    *,
+    ngram: int = 5,
+    min_hits: int = 3,
+    lookback: int = 4,
+) -> bool:
+    """检测「换皮复读」：本轮与近几轮共享多处连续片段（如反复「这些小事/说出来」）。
+
+    Jaccard 对同主题换说法常 <0.4 漏检；用 n-gram 重叠补洞。
+    """
+    sa = re.sub(r"\s+", "", (reply or ""))
+    if len(sa) < ngram:
+        return False
+    recent_ngrams = set()
+    for prev in (recent or [])[-lookback:]:
+        sb = re.sub(r"\s+", "", (prev or ""))
+        if len(sb) < ngram:
+            continue
+        for i in range(len(sb) - ngram + 1):
+            recent_ngrams.add(sb[i : i + ngram])
+    if not recent_ngrams:
+        return False
+    hits = 0
+    seen = set()
+    for i in range(len(sa) - ngram + 1):
+        gram = sa[i : i + ngram]
+        if gram in recent_ngrams and gram not in seen:
+            seen.add(gram)
+            hits += 1
+            if hits >= min_hits:
+                return True
+    return False
+
+
+def probe_chinese_input_understood(system_prompt: str, ui_lang: str) -> bool:
+    """非中文 UI 的系统提示是否包含「听懂任意语言输入（含中文）」契约。"""
+    from core.i18n import normalize_ui_language
+
+    lang = normalize_ui_language(ui_lang)
+    if lang == "zh":
+        return "输入理解" in (system_prompt or "") or "输出语言" in (system_prompt or "")
+    markers = (
+        "INPUT UNDERSTANDING",
+        "入力理解",
+        "입력 이해",
+        "COMPREENSÃO DA ENTRADA",
+        "COMPRENSIÓN DE ENTRADA",
+        "PEMAHAMAN INPUT",
+        "Chinese",
+        "中国語",
+        "중국어",
+        "chinês",
+        "chino",
+        "Mandarin",
+    )
+    text = system_prompt or ""
+    return any(m in text for m in markers)
+
+
 def run_probe_bundle(sample: Dict[str, Any]) -> Dict[str, Any]:
     """一次性跑一批探针，供埋点/单测。"""
     return {
@@ -59,5 +120,9 @@ def run_probe_bundle(sample: Dict[str, Any]) -> Dict[str, Any]:
         "near_dup": probe_near_duplicate(
             str(sample.get("prev_assistant") or ""),
             str(sample.get("assistant") or ""),
+        ),
+        "zh_input_ok": probe_chinese_input_understood(
+            str(sample.get("system_prompt") or ""),
+            str(sample.get("ui_lang") or "zh"),
         ),
     }

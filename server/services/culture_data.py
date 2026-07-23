@@ -216,6 +216,277 @@ def get_cultural_context(lang: str) -> str:
     return _CULTURAL_CONTEXTS.get(lang, _CULTURAL_CONTEXTS["zh"])
 
 
+# ——— 城市 → 主流文化/语言/意识形态锚点（生成与运行时共用）———
+# 覆盖 CITIES_DB 主城市；未知城市回退到语言级主流文化
+_CITY_LOCALE: dict[str, dict[str, str]] = {
+    # zh
+    "北京": {"lang": "zh", "region": "中国华北/首都圈", "language": "普通话（北京口语可轻可重）", "ideology": "重视秩序与面子、家庭期待与个人奋斗并存；社交偏含蓄，关系推进看长期承诺与实际行动。", "everyday": "地铁通勤、体制/互联网混搭节奏、胡同与写字楼、节假日仪式感强。"},
+    "上海": {"lang": "zh", "region": "中国长三角", "language": "普通话为主，偶有沪语氛围", "ideology": "务实精明、边界感与效率并重；看重自我提升与生活品质，关系里讲究体面与对等付出。", "everyday": "写字楼加班、咖啡厅约会、外卖与地铁、精致日常。"},
+    "成都": {"lang": "zh", "region": "中国西南", "language": "普通话带川渝语感", "ideology": "松弛感与人情味；乐天务实，重视朋友圈与烟火气，不爱硬卷口号。", "everyday": "火锅、茶馆、夜市、慢节奏社交。"},
+    "广州": {"lang": "zh", "region": "中国珠三角", "language": "普通话/粤语双语氛围", "ideology": "务实经商、家庭与口腹之欲并重；感情表达偏行动派，少空谈。", "everyday": "早茶、城际通勤、市井与现代并存。"},
+    "深圳": {"lang": "zh", "region": "中国珠三角移民城市", "language": "普通话为主的移民普通话", "ideology": "奋斗与流动感强；更开放多元，看重能力与结果，关系里也带效率与坦诚。", "everyday": "科技园、加班、城中村到高楼的对照。"},
+    "杭州": {"lang": "zh", "region": "中国长三角", "language": "普通话", "ideology": "互联网与传统江南气质交织；重视审美、体面与温和进取。", "everyday": "互联网公司、西湖周边、咖啡与外卖。"},
+    "武汉": {"lang": "zh", "region": "中国华中", "language": "普通话带武汉语感", "ideology": "直爽热络、抗压强；看重义气与实在，不喜欢虚伪客套。", "everyday": "过江通勤、热干面、夜生活与市井。"},
+    "西安": {"lang": "zh", "region": "中国西北", "language": "普通话带陕西语感", "ideology": "厚重与务实并存；家庭 ethnos 感强，重情义，对传统与现代都能容纳。", "everyday": "古城与新区、面食、夜市。"},
+    "南京": {"lang": "zh", "region": "中国长三角", "language": "普通话", "ideology": "文气与稳重；重历史感与体面，关系推进偏细水长流。", "everyday": "高校氛围、城际通勤、街头美食。"},
+    "重庆": {"lang": "zh", "region": "中国西南", "language": "普通话带重庆语感", "ideology": "火辣直接、重江湖义气；情感表达更外放，讨厌拧巴。", "everyday": "山城通勤、火锅、夜景与加班。"},
+    # en
+    "New York": {"lang": "en", "region": "USA Northeast", "language": "American English (NYC pace)", "ideology": "Individual ambition, direct talk, diversity as default; relationships prize honesty and personal space.", "everyday": "subway, walk-ups, late nights, coffee-to-go."},
+    "Los Angeles": {"lang": "en", "region": "USA West Coast", "language": "American English (SoCal casual)", "ideology": "Optimistic self-branding, wellness and hustle mix; dating can be chill yet image-aware.", "everyday": "cars, brunch, gym, industry freelancers."},
+    "London": {"lang": "en", "region": "UK", "language": "British English", "ideology": "Understatement, dry humor, politeness with reserve; affection via banter more than grand declarations.", "everyday": "Tube, pubs, rainy walks, Sunday roast vibe."},
+    "San Francisco": {"lang": "en", "region": "USA Bay Area", "language": "American English (tech-casual)", "ideology": "Progressive, product/idea oriented, values authenticity and boundaries; pragmatism around work-life.", "everyday": "tech offices, transit/Uber, coffee, fog."},
+    "Seattle": {"lang": "en", "region": "USA Pacific Northwest", "language": "American English", "ideology": "Polite reserve, outdoorsy independence, low-key sincerity over flash.", "everyday": "rain, coffee, hiking weekends, tech/campus life."},
+    "Chicago": {"lang": "en", "region": "USA Midwest", "language": "American English", "ideology": "Straightforward, loyal, community-minded; less performative than coastal scenes.", "everyday": "neighborhoods, winters, sports talk, diners."},
+    "Boston": {"lang": "en", "region": "USA Northeast", "language": "American English", "ideology": "Education-proud, witty, a bit competitive; values competence and loyalty.", "everyday": "universities, walkable streets, seasons."},
+    "Austin": {"lang": "en", "region": "USA Texas", "language": "American English (Texas-casual)", "ideology": "Laid-back creativity + entrepreneurial streak; friendly directness.", "everyday": "live music, tacos, heat, startups."},
+    "Melbourne": {"lang": "en", "region": "Australia", "language": "Australian English", "ideology": "Egalitarian mateship, dry humor, work-life balance; dating often casual-first.", "everyday": "cafés, tram, footy, laneways."},
+    "Toronto": {"lang": "en", "region": "Canada", "language": "Canadian English", "ideology": "Polite multiculturalism, fairness, conflict-averse warmth; values inclusion and stability.", "everyday": "TTC, condos, seasons, diverse food."},
+    # ja
+    "東京": {"lang": "ja", "region": "日本首都圏", "language": "日本語（標準〜軽い東京弁）", "ideology": "遠慮・察し・空気読み；公私の距離を大切にし、告白・段階を重んじる。", "everyday": "電車通勤、コンビニ、カフェ、繁華街。"},
+    "大阪": {"lang": "ja", "region": "関西", "language": "日本語（関西弁気質）", "ideology": "明るく商売っ気と人情；冗談と本音が近いが、礼儀は欠かさない。", "everyday": "食い倒れ、電車、商店街。"},
+    "京都": {"lang": "ja", "region": "関西", "language": "日本語（丁寧寄り）", "ideology": "伝統と婉曲表現；表面の丁寧さの奥に本音。性急な踏み込みを嫌う。", "everyday": "寺社、観光と生活の同居、季節行事。"},
+    "札幌": {"lang": "ja", "region": "北海道", "language": "日本語", "ideology": "実直・距離感ある優しさ；自然と季節に根ざした価値観。", "everyday": "雪、ビール、広い街並み。"},
+    "福岡": {"lang": "ja", "region": "九州", "language": "日本語（九州気質）", "ideology": "親しみやすく開放的；食と地元愛が強い。", "everyday": "屋台、地下鉄、海近い日常。"},
+    "名古屋": {"lang": "ja", "region": "中部", "language": "日本語", "ideology": "堅実・実利；派手さより積み上げ。", "everyday": "ものづくり、鉄道、地元メシ。"},
+    "横浜": {"lang": "ja", "region": "首都圏", "language": "日本語", "ideology": "都会的で国際色；丁寧だが東京より少しゆったり。", "everyday": "港、みなとみらい、通勤。"},
+    "神戸": {"lang": "ja", "region": "関西", "language": "日本語", "ideology": "洒落っ気と上品さ；異国情緒と礼儀。", "everyday": "港町、スイーツ、坂道。"},
+    "仙台": {"lang": "ja", "region": "東北", "language": "日本語", "ideology": "控えめ誠実；派手な自己主張より継続の信頼。", "everyday": "学都、杜の都、季節の明確さ。"},
+    "広島": {"lang": "ja", "region": "中国地方", "language": "日本語", "ideology": "実直・地元愛；平和と生活実感を重んじる。", "everyday": "路面電車、お好み焼き、瀬戸内。"},
+    # ko
+    "서울": {"lang": "ko", "region": "한국 수도권", "language": "한국어（서울 표준）", "ideology": "성취·속도·체면과 애정표현이 공존；기념일·응답속도·관계 단계에 민감.", "everyday": "지하철, 카페, 배달, 야근."},
+    "부산": {"lang": "ko", "region": "영남", "language": "한국어（부산 기질）", "ideology": "직설·정 많음；허세보다 실속과 의리.", "everyday": "바다, 시장, 사투리 톤."},
+    "인천": {"lang": "ko", "region": "수도권", "language": "한국어", "ideology": "실용·다양성；공항·무역 감각의 개방성.", "everyday": "교통 허브, 항구 도시 리듬."},
+    "대구": {"lang": "ko", "region": "영남", "language": "한국어", "ideology": "보수와 열정이 섞인 직정；관계에서 분명한 호불호.", "everyday": "내륙 도시, 먹거리, 더위."},
+    "광주": {"lang": "ko", "region": "호남", "language": "한국어", "ideology": "정의감·공동체 의식；감정 표현이 진한 편.", "everyday": "예술·민주화 기억과 일상 공존."},
+    "대전": {"lang": "ko", "region": "충청", "language": "한국어", "ideology": "차분·실무형；과학도시 분위기의 이성적 태도.", "everyday": "연구단지, 교통 요지."},
+    "울산": {"lang": "ko", "region": "영남", "language": "한국어", "ideology": "산업도시 실무주의；성실과 안정 중시.", "everyday": "공장·항만 리듬."},
+    "제주": {"lang": "ko", "region": "제주", "language": "한국어", "ideology": "여유·자연친화；육지 속도에 거리를 둠.", "everyday": "관광과 로컬의 이중 리듬."},
+    "수원": {"lang": "ko", "region": "수도권", "language": "한국어", "ideology": "서울 인접 실속형；가족·직장 균형.", "everyday": "출퇴근, 신도시 생활."},
+    "창원": {"lang": "ko", "region": "영남", "language": "한국어", "ideology": "계획도시 실용주의；안정적 관계 선호.", "everyday": "공업·주거 혼합."},
+    # pt (Brazil)
+    "São Paulo": {"lang": "pt", "region": "Brasil Sudeste", "language": "português brasileiro", "ideology": "Ambicioso, rápido, diversificado; valoriza conquista e calor humano no privado.", "everyday": "metrô, trânsito, coworking, boteco."},
+    "Rio de Janeiro": {"lang": "pt", "region": "Brasil Sudeste", "language": "português brasileiro (carioca)", "ideology": "Caloroso, corporal, presente; celebra alegria e vínculos sociais públicos.", "everyday": "praia, samba, morro/asfalto, WhatsApp áudios."},
+    "Salvador": {"lang": "pt", "region": "Brasil Nordeste", "language": "português brasileiro", "ideology": "Afeto, fé e festa; comunidade e ancestralidade importam.", "everyday": "axé, praia, família ampliada."},
+    "Brasília": {"lang": "pt", "region": "Brasil Centro-Oeste", "language": "português brasileiro", "ideology": "Mais formal/planejado; mistura serviço público e vida de cidade nova.", "everyday": "eixos, carros, fins de semana."},
+    "Belo Horizonte": {"lang": "pt", "region": "Brasil Sudeste", "language": "português brasileiro", "ideology": "Mineiro reservado no começo, leal depois; comida e conversa longas.", "everyday": "boteco, pão de queijo, serra."},
+    "Fortaleza": {"lang": "pt", "region": "Brasil Nordeste", "language": "português brasileiro", "ideology": "Acolhedor, solar, direto no afeto; valoriza presença.", "everyday": "praia, calor, família."},
+    "Curitiba": {"lang": "pt", "region": "Brasil Sul", "language": "português brasileiro", "ideology": "Mais contido, ordem e planejamento; humor seco.", "everyday": "frio relativo, parques, rotina."},
+    "Porto Alegre": {"lang": "pt", "region": "Brasil Sul", "language": "português brasileiro", "ideology": "Opinião forte, chimarrão e debate; lealdade de grupo.", "everyday": "churrasco, frio, política cotidiana."},
+    "Recife": {"lang": "pt", "region": "Brasil Nordeste", "language": "português brasileiro", "ideology": "Criativo, afetuoso, resistência e festa juntas.", "everyday": "maracatu, praia, tecnologia local."},
+    "Manaus": {"lang": "pt", "region": "Brasil Norte", "language": "português brasileiro", "ideology": "Orgulho amazônico, adaptação e calor humano; ritmo próprio.", "everyday": "rio, calor, comércio zonal."},
+    # es
+    "Madrid": {"lang": "es", "region": "España", "language": "español (castellano)", "ideology": "Directo, sociable, valora sobremesa y familia; pasión sin perder humor.", "everyday": "tapas, metro, noches largas."},
+    "Barcelona": {"lang": "es", "region": "España Cataluña", "language": "español / catalán ambiente", "ideology": "Abierta, creativa, independencia cultural; mix cosmopolita.", "everyday": "playa-ciudad, terrazas, diseño."},
+    "México City": {"lang": "es", "region": "México", "language": "español mexicano", "ideology": "Cálido, ingenioso, familia amplia; resiliencia y humor ante el caos urbano.", "everyday": "metro, antojitos, tráfico, fiestas."},
+    "Buenos Aires": {"lang": "es", "region": "Argentina", "language": "español rioplatense", "ideology": "Intelectual, apasionado, opinado; amistad intensa y ironía.", "everyday": "café, tango vibe, protesta y charla."},
+    "Lima": {"lang": "es", "region": "Perú", "language": "español peruano", "ideology": "Cortés, comida como afecto, mezcla tradición y modernidad.", "everyday": "ceiche, niebla, familia."},
+    "Bogotá": {"lang": "es", "region": "Colombia", "language": "español colombiano", "ideology": "Educado, trabajador, afectuoso con cercanos; paciencia urbana.", "everyday": "TransMilenio, frío de altura, cafés."},
+    "Santiago": {"lang": "es", "region": "Chile", "language": "español chileno", "ideology": "Reservado al inicio, leal luego; humor propio y pragmatismo.", "everyday": "metro, cerros, once."},
+    "Valencia": {"lang": "es", "region": "España", "language": "español", "ideology": "Mediterráneo, fiesta y comida; equilibrio vida-trabajo.", "everyday": "paella, playa, fallas vibe."},
+    "Sevilla": {"lang": "es", "region": "España Andalucía", "language": "español andaluz", "ideology": "Cálido, ceremonial, orgullo local; emotividad abierta.", "everyday": "tapas, calor, feria."},
+    "Guadalajara": {"lang": "es", "region": "México", "language": "español mexicano", "ideology": "Tradición y calidez; familia y música como ejes.", "everyday": "mariachi, mercados, barrios."},
+    # id
+    "Jakarta": {"lang": "id", "region": "Indonesia", "language": "Bahasa Indonesia", "ideology": "Sopan, hierarki usia, gotong royong; ambisi kota besar + hormat keluarga.", "everyday": "macet, ojol, mall, WhatsApp."},
+    "Surabaya": {"lang": "id", "region": "Jawa Timur", "language": "Bahasa Indonesia", "ideology": "Tegas, praktis, setia; kurang basa-basi kosong.", "everyday": "dagangan, pantai dekat, kerja keras."},
+    "Bandung": {"lang": "id", "region": "Jawa Barat", "language": "Bahasa Indonesia", "ideology": "Kreatif, santai-hangat; komunitas dan kopi.", "everyday": "kuliner, sejuk, kampus."},
+    "Medan": {"lang": "id", "region": "Sumatra", "language": "Bahasa Indonesia", "ideology": "Blak-blakan, kuat keluarga etnis-mix; loyalitas tinggi.", "everyday": "makanan kaya rasa, kota sibuk."},
+    "Makassar": {"lang": "id", "region": "Sulawesi", "language": "Bahasa Indonesia", "ideology": "Bangga lokal, tegas tapi hangat; laut sebagai identitas.", "everyday": "pantai, kuliner laut."},
+    "Yogyakarta": {"lang": "id", "region": "Jawa", "language": "Bahasa Indonesia", "ideology": "Halus, budaya-adiluhung, hormat; pacaran sering lebih sopan.", "everyday": "kampus, malioboro, malam angkringan."},
+    "Semarang": {"lang": "id", "region": "Jawa Tengah", "language": "Bahasa Indonesia", "ideology": "Tenang, ramah, nilai kekeluargaan.", "everyday": "kota pesisir, kuliner."},
+    "Bali": {"lang": "id", "region": "Bali", "language": "Bahasa Indonesia", "ideology": "Spiritual-harmoni, terbuka pada wisatawan tapi jaga adat; hidup seimbang.", "everyday": "pura, pantai, hospitality."},
+    "Palembang": {"lang": "id", "region": "Sumatra", "language": "Bahasa Indonesia", "ideology": "Hangat, bangga kuliner/sungai; kekeluargaan.", "everyday": "pempek, sungai Musi."},
+    "Malang": {"lang": "id", "region": "Jawa Timur", "language": "Bahasa Indonesia", "ideology": "Santai-edukatif, komunitas muda; ramah tanpa lebay.", "everyday": "kampus, sejuk, wisata dekat."},
+}
+
+_LANG_MAINSTREAM: dict[str, dict[str, str]] = {
+    "zh": {"region": "中国都市", "language": "简体中文/普通话", "ideology": "含蓄务实、家庭与面子、长期关系与行动表达关心。", "everyday": "微信、外卖、地铁、节假日仪式。"},
+    "en": {"region": "Western urban", "language": "English", "ideology": "Directness, personal autonomy, negotiated boundaries in dating.", "everyday": "texting, coffee, weekends out."},
+    "ja": {"region": "日本都市", "language": "日本語", "ideology": "遠慮・察し・段階的関係；記念日と気遣い。", "everyday": "LINE、電車、コンビニ。"},
+    "ko": {"region": "한국 도시", "language": "한국어", "ideology": "속도·기념일·애교와 체면의 썸과 분명한 단계.", "everyday": "카톡, 카페, 배달."},
+    "pt": {"region": "Brasil urbano", "language": "português brasileiro", "ideology": "Calor afetivo, presença, família e celebração.", "everyday": "WhatsApp, praia/churrasco, áudios."},
+    "es": {"region": "mundo hispano urbano", "language": "español", "ideology": "Expresividad, familia, sobremesa y pasión mesurada por contexto local.", "everyday": "tapas/café, WhatsApp, familia."},
+    "id": {"region": "Indonesia urban", "language": "Bahasa Indonesia", "ideology": "Sopan santun, hormat orang tua, gotong royong, ungkapan tidak selalu langsung.", "everyday": "WhatsApp, ojol, mall, Lebaran."},
+}
+
+
+def _normalize_city_key(city: str) -> str:
+    return (city or "").strip()
+
+
+def resolve_locale(city: str, lang: str | None = None) -> dict[str, str]:
+    """解析城市对应的主流文化锚点；城市优先，其次语言级默认。"""
+    key = _normalize_city_key(city)
+    if key in _CITY_LOCALE:
+        return dict(_CITY_LOCALE[key])
+    # 模糊匹配：子串
+    lower = key.lower()
+    for cname, meta in _CITY_LOCALE.items():
+        if lower and (lower in cname.lower() or cname.lower() in lower):
+            return dict(meta)
+    lk = (lang or infer_language_from_city(city) or "zh").split("-")[0].lower()
+    base = dict(_LANG_MAINSTREAM.get(lk, _LANG_MAINSTREAM["zh"]))
+    base["lang"] = lk
+    return base
+
+
+def get_cultural_context_for_city(city: str, lang: str | None = None) -> str:
+    """生成人设用：语言文化指令 + 城市主流文化/意识形态锚点。"""
+    locale = resolve_locale(city, lang)
+    lk = locale.get("lang") or (lang or "zh")
+    base = get_cultural_context(lk)
+    city_block = (
+        f"\n所在地主流文化锚点（必须遵守）：\n"
+        f"- 城市：{city or '（未指定）'}\n"
+        f"- 地区：{locale.get('region', '')}\n"
+        f"- 主流语言：{locale.get('language', '')}\n"
+        f"- 主流意识形态与关系观：{locale.get('ideology', '')}\n"
+        f"- 日常生活环境：{locale.get('everyday', '')}\n"
+        f"- 要求：life_story 的成长环境必须能支撑 cultural_values；"
+        f"cultural_values 必须写清「家庭/学校/阶层经历 → 当前城市生活 → 对权威/自由/集体/家庭/金钱/亲密关系的态度」因果链；"
+        f"默认贴合当地主流；若有非主流立场，须用成长经历解释，且仍用当地主流语言表达。"
+    )
+    return f"{base}\n{city_block}"
+
+
+_IDEOLOGY_RULES: dict[str, str] = {
+    "zh": (
+        "\n\n【意识形态一致性 — 强制】\n"
+        "你的判断、立场与表达必须同时符合：\n"
+        "1) 【成长经历】原生家庭、教育、阶层与重大转折塑造的立场；\n"
+        "2) 【生活环境】当前城市的日常节奏、社交圈与媒介习惯；\n"
+        "3) 【所在地主流文化与语言】当地默认礼貌距离、家庭/集体观、对权威与自由的态度，并用当地主流语言自然说话。\n"
+        "禁止套用与城市/成长不符的另一套「全球通用年轻人」话术；非主流观点可以有，但须能从经历解释，且不切换成外人设语言。"
+    ),
+    "en": (
+        "\n\n[IDEOLOGY CONSISTENCY — MANDATORY]\n"
+        "Your judgments and tone must fit all of:\n"
+        "1) Life story (family, schooling, class, turning points);\n"
+        "2) Current city living environment (pace, social circle, media habits);\n"
+        "3) Local mainstream culture & language (politeness distance, family/collective norms, authority vs freedom) spoken in that mainstream language.\n"
+        "Do not paste a generic global-youth script that contradicts city/upbringing. Non-mainstream views are allowed only if grounded in your history."
+    ),
+    "ja": (
+        "\n\n【イデオロギー一貫性 — 必須】\n"
+        "判断・価値観・話し方は次のすべてに整合させること：\n"
+        "1) 成長歴（家庭・教育・階層・転機）\n"
+        "2) 現在の都市生活環境\n"
+        "3) 現地の主流文化と言語（距離感、家族観、権威と自由への態度）\n"
+        "都市/経歴と矛盾する「グローバル若者テンプレ」禁止。非主流でも経歴で説明でき、現地語で自然に。"
+    ),
+    "ko": (
+        "\n\n【이념 일관성 — 필수】\n"
+        "판단·입장·말투는 다음에 모두 맞출 것:\n"
+        "1) 성장 서사(가정·교육·계층·전환점)\n"
+        "2) 현재 도시 생활환경\n"
+        "3) 현지 주류 문화·언어(거리감, 가족/집단, 권위와 자유)\n"
+        "도시/성장과 어긋나는 글로벌 청년 템플릿 금지. 비주류여도 이력으로 설명하고 현지 언어로."
+    ),
+    "pt": (
+        "\n\n[CONSISTÊNCIA IDEOLÓGICA — OBRIGATÓRIO]\n"
+        "Julgamentos e tom devem caber em: história de vida; ambiente urbano atual; cultura e idioma locais majoritários. "
+        "Proibido script genérico global que contradiga a cidade/criação. Visões não majoritárias só com base biográfica."
+    ),
+    "es": (
+        "\n\n[CONSISTENCIA IDEOLÓGICA — OBLIGATORIO]\n"
+        "Juicios y tono deben encajar con: historia de vida; entorno urbano actual; cultura e idioma locales mayoritarios. "
+        "Prohibido guion global genérico que contradiga ciudad/crianza. Visiones no mayoritarias solo si se explican por la biografía."
+    ),
+    "id": (
+        "\n\n[KONSISTENSI IDEOLOGI — WAJIB]\n"
+        "Penilaian dan nada harus selaras dengan: riwayat tumbuh; lingkungan kota sekarang; budaya & bahasa arus utama setempat. "
+        "Dilarang skrip anak muda global yang bertentangan dengan kota/latar. Pandangan non-arus utama hanya jika bisa dijelaskan dari riwayat."
+    ),
+}
+
+
+def ideology_consistency_rule(lang: str, city: str = "") -> str:
+    lk = (lang or "zh").split("-")[0].lower()
+    rule = _IDEOLOGY_RULES.get(lk, _IDEOLOGY_RULES["zh"])
+    locale = resolve_locale(city, lk)
+    anchor = {
+        "zh": f"\n【本地锚点】{city or locale.get('region')}｜{locale.get('language')}｜{locale.get('ideology')}",
+        "en": f"\n[Local anchor] {city or locale.get('region')} | {locale.get('language')} | {locale.get('ideology')}",
+        "ja": f"\n【ローカル錨】{city or locale.get('region')}｜{locale.get('language')}｜{locale.get('ideology')}",
+        "ko": f"\n【로컬 앵커】{city or locale.get('region')}｜{locale.get('language')}｜{locale.get('ideology')}",
+        "pt": f"\n[Âncora local] {city or locale.get('region')} | {locale.get('language')} | {locale.get('ideology')}",
+        "es": f"\n[Ancla local] {city or locale.get('region')} | {locale.get('language')} | {locale.get('ideology')}",
+        "id": f"\n[Jangkar lokal] {city or locale.get('region')} | {locale.get('language')} | {locale.get('ideology')}",
+    }.get(lk, "")
+    return rule + anchor
+
+
+def format_cultural_values_for_prompt(cultural_values: str, lang: str, city: str = "") -> str:
+    """运行时注入：一致性规则 + 文化三观正文。"""
+    cv = (cultural_values or "").strip()
+    headers = {
+        "zh": "【文化三观与意识形态】",
+        "en": "[Cultural values & ideology]",
+        "ja": "【文化的価値観・イデオロギー】",
+        "ko": "【문화적 가치관·이념】",
+        "pt": "[Valores culturais e ideologia]",
+        "es": "[Valores culturales e ideología]",
+        "id": "[Nilai budaya & ideologi]",
+    }
+    lk = (lang or "zh").split("-")[0].lower()
+    body = cv if cv else {
+        "zh": "（未填写；默认贴合所在地主流文化，并以成长经历自洽）",
+        "en": "(unset; default to local mainstream culture, consistent with life story)",
+        "ja": "（未設定；現地主流に合わせ、成長歴と矛盾させない）",
+        "ko": "(미기입; 현지 주류에 맞추고 성장 서사와 모순 없게)",
+        "pt": "(vazio; alinhar à cultura local majoritária e à história de vida)",
+        "es": "(vacío; alinear con cultura local mayoritaria e historia de vida)",
+        "id": "(kosong; selaraskan dengan budaya lokal arus utama dan riwayat hidup)",
+    }.get(lk, "")
+    return f"{ideology_consistency_rule(lk, city)}\n{headers.get(lk, headers['zh'])}\n{body}"
+
+
+def default_cultural_values(name: str, city: str, lang: str, values: str = "") -> str:
+    """缺省 cultural_values：按城市主流文化生成，禁止全球通用空话。"""
+    locale = resolve_locale(city, lang)
+    lk = locale.get("lang") or lang or "zh"
+    v = (values or "").strip()
+    templates = {
+        "zh": (
+            f"{name}的意识形态贴合{city or locale.get('region')}的主流生活：{locale.get('ideology')}"
+            f"日常里{locale.get('everyday')}。更看重{v or '真实与尊重'}，"
+            "对权威不盲从也不无谓对抗，倾向在集体体面与个人边界之间找平衡；"
+            "亲密关系里用行动和长期陪伴证明在意，而不是空喊口号。"
+        ),
+        "en": (
+            f"{name}'s worldview fits mainstream life in {city or locale.get('region')}: {locale.get('ideology')} "
+            f"Daily life: {locale.get('everyday')}. Values {v or 'honesty and respect'}; "
+            "neither blindly obedient nor needlessly rebellious—balances autonomy with belonging; "
+            "shows care through consistency more than slogans."
+        ),
+        "ja": (
+            f"{name}の価値観は{city or locale.get('region')}の主流に沿う：{locale.get('ideology')}"
+            f"日常は{locale.get('everyday')}。大切にするのは{v or '誠実と尊重'}。"
+            "権威には盲従せず、無用な対立も避け、関係では気遣いと継続で示す。"
+        ),
+        "ko": (
+            f"{name}의 이념은 {city or locale.get('region')} 주류에 맞춰져 있다: {locale.get('ideology')} "
+            f"일상은 {locale.get('everyday')}. {v or '진솔함과 존중'}을 중시하고, "
+            "권위에 맹종하지도 괜히 맞서지도 않으며, 관계에서는 말보다 지속적 행동으로 마음을 보인다."
+        ),
+        "pt": (
+            f"A ideologia de {name} alinha-se ao cotidiano majoritário de {city or locale.get('region')}: {locale.get('ideology')} "
+            f"Vive {locale.get('everyday')}. Valoriza {v or 'verdade e respeito'}; "
+            "nem obedece cego nem provoca à toa; no amor, presença fala mais que slogan."
+        ),
+        "es": (
+            f"La ideología de {name} encaja con la vida mayoritaria en {city or locale.get('region')}: {locale.get('ideology')} "
+            f"Cotidianidad: {locale.get('everyday')}. Valora {v or 'honestidad y respeto'}; "
+            "ni obediencia ciega ni rebeldía vacía; en el vínculo, constancia antes que lemas."
+        ),
+        "id": (
+            f"Ideologi {name} selaras dengan arus utama di {city or locale.get('region')}: {locale.get('ideology')} "
+            f"Keseharian: {locale.get('everyday')}. Mengutamakan {v or 'kejujuran dan rasa hormat'}; "
+            "tidak patuh buta, tidak juga memberontak sia-sia; dalam hubungan, tindakan lebih penting daripada slogan."
+        ),
+    }
+    return templates.get(lk, templates["zh"])
+
+
 # 与 NAMES_DB / CITIES_DB 键一致；与管理端单语言/全语言列表对齐
 BATCH_GENERATION_VALID_LANGS = frozenset({"zh", "en", "ja", "ko", "es", "pt", "id"})
 

@@ -3,6 +3,13 @@
 
 热路径：add / get_recent 只走 Redis，聊天不被 PostgreSQL 写入延迟阻塞。
 冷路径：后台 worker 批量 flush 到 PostgreSQL 持久化。
+
+Room 键规范（按登录 token 解析出的 user_id 隔离，不把明文 token 写入 key）：
+  room:{companion_id}:u:{user_id}:msgs
+  room:{companion_id}:u:{user_id}:count
+  room:flush:queue / room:flush:processing / room:flush:lock
+
+TTL：默认 CHAT_REDIS_TTL_SECONDS=604800（7 天）；写入追加并续期，热读/激活亦续期。
 """
 from __future__ import annotations
 
@@ -21,9 +28,11 @@ logger = logging.getLogger(__name__)
 CHAT_REDIS_BRIDGE = os.getenv("CHAT_REDIS_BRIDGE", "1").lower() in ("1", "true", "yes")
 CHAT_BUFFER_MAX = int(os.getenv("CHAT_BUFFER_MAX", "200"))
 CHAT_REDIS_TTL = int(os.getenv("CHAT_REDIS_TTL_SECONDS", "604800"))  # 7d
-FLUSH_QUEUE_KEY = "chat:flush:queue"
-FLUSH_PROCESSING_KEY = "chat:flush:processing"
-FLUSH_LOCK_KEY = "chat:flush:lock"
+
+# 业务前缀 room: — 热读按用户房间隔离，flush 全局队列同属 room 域
+FLUSH_QUEUE_KEY = "room:flush:queue"
+FLUSH_PROCESSING_KEY = "room:flush:processing"
+FLUSH_LOCK_KEY = "room:flush:lock"
 FLUSH_LOCK_TTL = int(os.getenv("CHAT_FLUSH_LOCK_TTL", "30"))
 
 
@@ -31,16 +40,79 @@ def bridge_enabled() -> bool:
     return CHAT_REDIS_BRIDGE and redis_enabled()
 
 
-def _scope_suffix(user_id: Optional[int] = None) -> str:
-    return f":{user_id}" if user_id is not None else ""
+def room_key(companion_id: str, user_id: int) -> str:
+    """用户+伴侣会话房间：room:{companion_id}:u:{user_id}"""
+    return f"room:{companion_id}:u:{int(user_id)}"
 
 
-def _msgs_key(companion_id: str, user_id: Optional[int] = None) -> str:
-    return f"chat:msgs:{companion_id}{_scope_suffix(user_id)}"
+def _msgs_key(companion_id: str, user_id: int) -> str:
+    return f"{room_key(companion_id, user_id)}:msgs"
 
 
-def _count_key(companion_id: str, user_id: Optional[int] = None) -> str:
-    return f"chat:count:{companion_id}{_scope_suffix(user_id)}"
+def _count_key(companion_id: str, user_id: int) -> str:
+    return f"{room_key(companion_id, user_id)}:count"
+
+
+def _touch_room(r, companion_id: str, user_id: int) -> None:
+    """再次激活（读/写）时重置 TTL，供轮询热读继续命中。"""
+    msgs_key = _msgs_key(companion_id, user_id)
+    count_key = _count_key(companion_id, user_id)
+    pipe = r.pipeline(transaction=False)
+    pipe.expire(msgs_key, CHAT_REDIS_TTL)
+    pipe.expire(count_key, CHAT_REDIS_TTL)
+    pipe.execute()
+
+
+def _legacy_msgs_key(companion_id: str, user_id: int) -> str:
+    """迁移前旧键：chat:msgs:{companion_id}:{user_id}"""
+    return f"chat:msgs:{companion_id}:{int(user_id)}"
+
+
+def _legacy_count_key(companion_id: str, user_id: int) -> str:
+    return f"chat:count:{companion_id}:{int(user_id)}"
+
+
+def _migrate_legacy_room(r, companion_id: str, user_id: int) -> bool:
+    """若新 room 键为空且存在旧 chat:msgs 键，则 rename/拷贝到 room: 并续期。"""
+    msgs_key = _msgs_key(companion_id, user_id)
+    if r.llen(msgs_key) > 0:
+        return False
+    legacy = _legacy_msgs_key(companion_id, user_id)
+    if not r.exists(legacy):
+        return False
+    # 优先 RENAME（同 DB 原子）；失败则 DUMP 式拷贝
+    try:
+        r.rename(legacy, msgs_key)
+    except Exception:
+        raw_list = r.lrange(legacy, 0, -1)
+        if not raw_list:
+            return False
+        pipe = r.pipeline(transaction=True)
+        for raw in raw_list[-CHAT_BUFFER_MAX:]:
+            pipe.rpush(msgs_key, raw)
+        pipe.expire(msgs_key, CHAT_REDIS_TTL)
+        pipe.execute()
+        r.delete(legacy)
+
+    count_key = _count_key(companion_id, user_id)
+    legacy_count = _legacy_count_key(companion_id, user_id)
+    if r.exists(legacy_count) and not r.exists(count_key):
+        try:
+            r.rename(legacy_count, count_key)
+        except Exception:
+            val = r.get(legacy_count)
+            if val is not None:
+                r.set(count_key, val)
+            r.delete(legacy_count)
+    if not r.exists(count_key):
+        r.set(count_key, r.llen(msgs_key))
+    _touch_room(r, companion_id, user_id)
+    logger.info(
+        "Migrated legacy chat cache %s → %s",
+        legacy,
+        msgs_key,
+    )
+    return True
 
 
 def _now_iso() -> str:
@@ -53,11 +125,15 @@ def append_message(
     content: str,
     user_id: Optional[int] = None,
 ) -> Dict[str, Any]:
-    """写入 Redis 并加入 flush 队列；返回消息条目。"""
+    """写入 Redis room 并加入 flush 队列；返回消息条目。须有 token 对应用户。"""
+    if user_id is None:
+        raise ValueError("room redis write requires user_id from auth token")
     r = get_redis_client()
     if not r:
         raise RuntimeError("Redis unavailable for chat cache")
 
+    uid = int(user_id)
+    _migrate_legacy_room(r, companion_id, uid)
     temp_id = f"t{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}"
     entry: Dict[str, Any] = {
         "id": None,
@@ -65,22 +141,20 @@ def append_message(
         "role": role,
         "content": content,
         "timestamp": _now_iso(),
-        "user_id": user_id,
+        "user_id": uid,
     }
-    msgs_key = _msgs_key(companion_id, user_id)
-    count_key = _count_key(companion_id, user_id)
+    msgs_key = _msgs_key(companion_id, uid)
+    count_key = _count_key(companion_id, uid)
     pipe = r.pipeline(transaction=True)
     pipe.rpush(msgs_key, json.dumps(entry, ensure_ascii=False))
     pipe.ltrim(msgs_key, -CHAT_BUFFER_MAX, -1)
     pipe.expire(msgs_key, CHAT_REDIS_TTL)
-    pipe.incr(count_key)
-    pipe.expire(count_key, CHAT_REDIS_TTL)
     pipe.rpush(
         FLUSH_QUEUE_KEY,
         json.dumps(
             {
                 "companion_id": companion_id,
-                "user_id": user_id,
+                "user_id": uid,
                 "role": role,
                 "content": content,
                 "timestamp": entry["timestamp"],
@@ -90,6 +164,21 @@ def append_message(
         ),
     )
     pipe.execute()
+    # count 在 warm_from_db 后可能被 delete，再 incr 会从 1 低估；与 llen 对齐
+    try:
+        llen = int(r.llen(msgs_key) or 0)
+        raw_c = r.get(count_key)
+        if raw_c is None:
+            r.set(count_key, llen)
+        else:
+            cur = int(raw_c)
+            if cur < llen:
+                r.set(count_key, llen)
+            else:
+                r.incr(count_key)
+        r.expire(count_key, CHAT_REDIS_TTL)
+    except Exception:
+        logger.debug("chat count heal failed for %s", msgs_key, exc_info=True)
     return entry
 
 
@@ -99,15 +188,22 @@ def get_recent(
     offset: int = 0,
     user_id: Optional[int] = None,
 ) -> Optional[List[Dict[str, Any]]]:
-    """从 Redis 读取最近消息；offset>0 时返回 None 交由 PG 分页。"""
-    if offset > 0:
+    """从 Redis room 热读；缺 user_id / offset>0 时返回 None 交由 PG。"""
+    if offset > 0 or user_id is None:
         return None
     r = get_redis_client()
     if not r:
         return None
-    raw_list = r.lrange(_msgs_key(companion_id, user_id), -n, -1)
+    uid = int(user_id)
+    try:
+        _migrate_legacy_room(r, companion_id, uid)
+    except Exception:
+        logger.debug("legacy room migrate on read failed", exc_info=True)
+    msgs_key = _msgs_key(companion_id, uid)
+    raw_list = r.lrange(msgs_key, -n, -1)
     if not raw_list:
         return []
+    _touch_room(r, companion_id, uid)
     out: List[Dict[str, Any]] = []
     seq = 1
     for raw in raw_list:
@@ -116,7 +212,8 @@ def get_recent(
         except json.JSONDecodeError:
             continue
         if item.get("id") is None:
-            item["id"] = -(seq)
+            # 稳定 id：优先 temp_id，避免按窗口位置分配 -1/-2 导致前端合并错乱
+            item["id"] = item.get("temp_id") or f"tmp-{seq}"
             seq += 1
         out.append(item)
     return out
@@ -126,10 +223,15 @@ def get_last_assistant_content(
     companion_id: str,
     user_id: Optional[int] = None,
 ) -> Optional[str]:
+    if user_id is None:
+        return None
     r = get_redis_client()
     if not r:
         return None
-    raw_list = r.lrange(_msgs_key(companion_id, user_id), -30, -1)
+    uid = int(user_id)
+    raw_list = r.lrange(_msgs_key(companion_id, uid), -30, -1)
+    if raw_list:
+        _touch_room(r, companion_id, uid)
     for raw in reversed(raw_list):
         try:
             item = json.loads(raw)
@@ -141,17 +243,41 @@ def get_last_assistant_content(
 
 
 def get_total_count(companion_id: str, user_id: Optional[int] = None) -> Optional[int]:
+    """返回热房间消息总数估计；count 键缺失/低估时回退 llen，再不行交由 PG。"""
+    if user_id is None:
+        return None
     r = get_redis_client()
     if not r:
         return None
-    val = r.get(_count_key(companion_id, user_id))
+    uid = int(user_id)
+    msgs_key = _msgs_key(companion_id, uid)
+    count_key = _count_key(companion_id, uid)
+    try:
+        llen = int(r.llen(msgs_key) or 0)
+    except Exception:
+        llen = 0
+    val = r.get(count_key)
+    n: Optional[int] = None
     if val is not None:
         try:
-            return int(val)
+            n = int(val)
         except (TypeError, ValueError):
-            pass
-    length = r.llen(_msgs_key(companion_id, user_id))
-    return int(length) if length else 0
+            n = None
+    if n is not None and n > 0:
+        # warm 后 count 被删再 incr 会低估；至少不低于当前热列表长度
+        if llen > n:
+            try:
+                r.set(count_key, llen)
+                r.expire(count_key, CHAT_REDIS_TTL)
+            except Exception:
+                pass
+            n = llen
+        _touch_room(r, companion_id, uid)
+        return n
+    if llen > 0:
+        _touch_room(r, companion_id, uid)
+        return llen
+    return None
 
 
 def warm_from_db(
@@ -159,27 +285,44 @@ def warm_from_db(
     messages: List[Dict[str, Any]],
     user_id: Optional[int] = None,
 ) -> None:
-    """从 PostgreSQL 预热 Redis 缓冲（启动或 cache miss）。"""
-    if not messages:
+    """从 PostgreSQL 回填预热 Redis room（cache miss）。"""
+    if not messages or user_id is None:
         return
     r = get_redis_client()
     if not r:
         return
-    key = _msgs_key(companion_id, user_id)
+    uid = int(user_id)
+    key = _msgs_key(companion_id, uid)
     if r.llen(key) > 0:
+        # 房间已有热数据：仅续期，不覆盖追加列表
+        _touch_room(r, companion_id, uid)
         return
+    # PG 回填为权威热数据；清掉旧 chat:msgs 键，避免下次读到残缺旧缓存
+    r.delete(_legacy_msgs_key(companion_id, uid), _legacy_count_key(companion_id, uid))
     pipe = r.pipeline(transaction=True)
     for m in messages[-CHAT_BUFFER_MAX:]:
+        if isinstance(m, dict) and m.get("user_id") is None:
+            m = {**m, "user_id": uid}
         pipe.rpush(key, json.dumps(m, ensure_ascii=False))
     pipe.expire(key, CHAT_REDIS_TTL)
+    # 不在此写入 count：页面预热条数 ≠ 会话总条数，总数仍走 PG / incr
+    pipe.delete(_count_key(companion_id, uid))
     pipe.execute()
 
 
 def clear(companion_id: str, user_id: Optional[int] = None) -> None:
+    if user_id is None:
+        return
     r = get_redis_client()
     if not r:
         return
-    r.delete(_msgs_key(companion_id, user_id), _count_key(companion_id, user_id))
+    uid = int(user_id)
+    r.delete(
+        _msgs_key(companion_id, uid),
+        _count_key(companion_id, uid),
+        _legacy_msgs_key(companion_id, uid),
+        _legacy_count_key(companion_id, uid),
+    )
 
 
 def _requeue_stale_processing(r) -> int:

@@ -186,7 +186,9 @@ def get_embedding(text: str) -> Optional[List[float]]:
 
 
 # ===== ShortTermMemory (Redis 热路径 + PostgreSQL 异步持久化) =====
-_RING_BUFFER_SIZE = 60
+# 每轮回复注入近聊语料上限（消息级）；实际不足则全量，超过则截最近 N 条
+MEMORY_RECENT_MESSAGES = max(1, int(os.getenv("MEMORY_RECENT_MESSAGES", "30") or 30))
+_RING_BUFFER_SIZE = max(60, MEMORY_RECENT_MESSAGES)
 _ring_buffers: Dict[str, List[Dict]] = {}
 _ring_buffer_lock = threading.Lock()
 
@@ -249,7 +251,13 @@ class ShortTermMemory:
                     ts = datetime.fromisoformat(entry["timestamp"].replace("Z", "+00:00"))
                 except (TypeError, ValueError, KeyError):
                     ts = datetime.now(timezone.utc)
-                self._append_buffer(role, content, ts, entry.get("id"))
+                # Redis 条目 id 常为 None（未 flush）；ring 用 temp_id 便于前端去重
+                self._append_buffer(
+                    role,
+                    content,
+                    ts,
+                    entry.get("id") or entry.get("temp_id"),
+                )
                 return
             except Exception as e:
                 logger.warning(
@@ -314,30 +322,104 @@ class ShortTermMemory:
                 for m in reversed(msgs)
             ]
 
-    def get_recent(self, n: int = 60, offset: int = 0) -> List[Dict]:
-        if bridge_enabled() and offset == 0:
-            cached = redis_get_recent(self.companion_id, n, offset, user_id=self.user_id)
-            if cached is not None:
-                key = self._buf_key()
-                if cached:
-                    with _ring_buffer_lock:
-                        _ring_buffers[key] = cached[-_RING_BUFFER_SIZE:]
-                    return cached
-                pg_rows = self._pg_get_recent(n, offset)
-                if pg_rows:
-                    redis_warm_from_db(self.companion_id, pg_rows, user_id=self.user_id)
-                    with _ring_buffer_lock:
-                        _ring_buffers[key] = pg_rows[-_RING_BUFFER_SIZE:]
-                return pg_rows
+    @staticmethod
+    def _msg_ts_key(m: Dict) -> str:
+        return str((m or {}).get("timestamp") or "")
 
-        if offset == 0:
+    def _ring_snapshot(self) -> List[Dict]:
+        key = self._buf_key()
+        with _ring_buffer_lock:
+            buf = _ring_buffers.get(key, [])
+            return list(buf) if buf else []
+
+    def _prefer_fresher_rows(
+        self, redis_rows: Optional[List[Dict]], ring_rows: List[Dict], n: int
+    ) -> List[Dict]:
+        """Redis 与进程内 ring 取更新的一侧，避免二次打开读到落后热缓存。"""
+        candidates: List[List[Dict]] = []
+        if redis_rows:
+            candidates.append(redis_rows)
+        if ring_rows:
+            candidates.append(ring_rows)
+        if not candidates:
+            return []
+        best = max(
+            candidates,
+            key=lambda rows: (self._msg_ts_key(rows[-1]), len(rows)),
+        )
+        return best[-n:] if len(best) > n else list(best)
+
+    def _heal_short_from_pg(self, hot: List[Dict], n: int, offset: int) -> List[Dict]:
+        """热缓存不足 n 条时与 PG 比对；PG 更新则回填 Redis。"""
+        if offset != 0:
+            return hot
+        pg_rows = self._pg_get_recent(n, offset)
+        if not pg_rows:
+            return hot
+        if not hot or len(pg_rows) > len(hot) or (
+            len(pg_rows) >= len(hot)
+            and self._msg_ts_key(pg_rows[-1]) > self._msg_ts_key(hot[-1])
+        ):
+            from core.chat_cache import clear as redis_clear_room
+
+            try:
+                redis_clear_room(self.companion_id, user_id=self.user_id)
+            except Exception:
+                pass
+            try:
+                redis_warm_from_db(self.companion_id, pg_rows, user_id=self.user_id)
+            except Exception:
+                logger.debug("redis warm after heal failed", exc_info=True)
             key = self._buf_key()
             with _ring_buffer_lock:
-                buf = _ring_buffers.get(key, [])
-                if buf:
-                    return list(buf[-n:]) if len(buf) > n else list(buf)
+                _ring_buffers[key] = pg_rows[-_RING_BUFFER_SIZE:]
+            return pg_rows
+        return hot
+
+    def get_recent(self, n: int = MEMORY_RECENT_MESSAGES, offset: int = 0) -> List[Dict]:
+        if offset == 0:
+            redis_rows: Optional[List[Dict]] = None
+            if bridge_enabled():
+                redis_rows = redis_get_recent(
+                    self.companion_id, n, offset, user_id=self.user_id
+                )
+            ring_rows = self._ring_snapshot()
+
+            # Redis 客户端不可用且 ring 空 → 直接 PG
+            if redis_rows is None and not ring_rows:
+                return self._pg_get_recent(n, offset)
+
+            hot = self._prefer_fresher_rows(redis_rows, ring_rows, n)
+
+            # 热数据不足窗口：与 PG 对齐（避免残缺 Redis 挡住最新）
+            if len(hot) < n:
+                hot = self._heal_short_from_pg(hot, n, offset)
+
+            if hot:
+                key = self._buf_key()
+                with _ring_buffer_lock:
+                    _ring_buffers[key] = hot[-_RING_BUFFER_SIZE:]
+                return hot
+
+            return self._pg_get_recent(n, offset)
 
         return self._pg_get_recent(n, offset)
+
+    def get_after(self, after_ts: str, limit: int = 50) -> List[Dict]:
+        """返回时间戳严格晚于 after_ts 的消息（升序），用于前端增量同步。"""
+        after_ts = (after_ts or "").strip()
+        if not after_ts:
+            return self.get_recent(limit, 0)
+
+        # 热路径：先看近窗；不足再放宽到 ring 上限
+        window = max(limit * 4, min(_RING_BUFFER_SIZE, 120))
+        recent = self.get_recent(window, 0)
+        newer = [m for m in recent if self._msg_ts_key(m) > after_ts]
+        if len(newer) >= limit or len(recent) < window:
+            return newer[-limit:] if len(newer) > limit else newer
+
+        # 近窗全是新消息：可能还有更早缺口，但增量场景只需「比本地 tip 更新」
+        return newer[-limit:] if len(newer) > limit else newer
 
     def warm_buffer(self):
         key = self._buf_key()
@@ -631,7 +713,7 @@ class CompanionMemory:
         short = self.short_term
         if user_id is not None and short.user_id != user_id:
             short = ShortTermMemory(self.companion_id, user_id=user_id)
-        recent = short.get_recent(60)
+        recent = short.get_recent(MEMORY_RECENT_MESSAGES)
         episodes = []
         if query:
             episodes = self.episodic.search(query, top_k=5)
@@ -652,29 +734,33 @@ class CompanionMemory:
         relation_card_text: str = "",
         truncate_episodes: bool = False,
     ) -> str:
-        """构建上下文提示。user_id 传入时按该用户读近聊（REQ-A2）。"""
+        """构建上下文提示。user_id 传入时按该用户读近聊（REQ-A2）。
+
+        规则：每个对话发送下一条前，读取近聊作为【最近对话】语料：
+        - 不足 MEMORY_RECENT_MESSAGES（默认 30）条 → 以实际条数为准
+        - 超过则只取最近 MEMORY_RECENT_MESSAGES 条
+        关系卡/事实不得挤掉该窗口。
+        """
         tier = (tier or "full").lower()
+        recent_n = MEMORY_RECENT_MESSAGES
         if tier == "compact":
             max_chars = min(max_chars, 800)
             max_facts = 3
-            max_turns = 8
+            recent_n = min(16, MEMORY_RECENT_MESSAGES)
             episode_limit = 2
-            dialogue_reserve = min(400, max_chars // 2)
+            dialogue_reserve = min(500, max_chars // 2)
         else:
-            # 理解优先：给近聊留足预算，避免关系卡挤掉指代上下文
-            full_cap = int(os.getenv("MEMORY_FULL_MAX_CHARS", "3200"))
+            # 理解优先：近聊窗口留足预算，避免关系卡挤掉语料
+            full_cap = int(os.getenv("MEMORY_FULL_MAX_CHARS", "6500") or 6500)
             max_chars = min(max_chars, full_cap) if max_chars > 2000 else max_chars
-            if max_chars < 2200:
-                max_chars = min(full_cap, max(max_chars, 2800))
+            if max_chars < 4000:
+                max_chars = min(full_cap, max(max_chars, 5000))
             max_facts = 6
-            max_turns = 14
             episode_limit = 4
-            dialogue_reserve = int(os.getenv("MEMORY_DIALOGUE_RESERVE", "1200"))
+            dialogue_reserve = int(os.getenv("MEMORY_DIALOGUE_RESERVE", "4500") or 4500)
 
-        if relation_card_text:
-            max_turns = min(max_turns, 12)
-            if truncate_episodes:
-                episode_limit = min(episode_limit, 3)
+        if relation_card_text and truncate_episodes:
+            episode_limit = min(episode_limit, 3)
 
         need_vector = bool(query) and (
             len(query) > 6
@@ -744,13 +830,18 @@ class CompanionMemory:
                 other_parts.append((ep_text, 60))
 
         dialogue_text = ""
-        recent_turns = short.get_recent_turns(max_turns=max_turns)
-        if recent_turns:
+        # 近聊语料：不足 recent_n 条用实际数量；超过则只取最近 recent_n 条
+        recent_msgs = list(short.get_recent(recent_n) or [])[-recent_n:]
+        if recent_msgs:
             dialogue_lines = ["【最近对话】"]
-            for msg in recent_turns:
-                who = "他" if msg["role"] == "user" else "你"
-                dialogue_lines.append(f"{who}：{msg['content']}")
-            dialogue_text = "\n".join(dialogue_lines)
+            for msg in recent_msgs:
+                content = (msg.get("content") or "").strip()
+                if not content:
+                    continue
+                who = "他" if msg.get("role") == "user" else "你"
+                dialogue_lines.append(f"{who}：{content}")
+            if len(dialogue_lines) > 1:
+                dialogue_text = "\n".join(dialogue_lines)
 
         # 先装近聊（理解预算），再装关系卡/事实
         result_parts = []

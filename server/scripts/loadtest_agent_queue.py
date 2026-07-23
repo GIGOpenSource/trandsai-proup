@@ -127,7 +127,7 @@ async def run(args: argparse.Namespace) -> None:
     else:
         print("latency: n/a (no successful replies)")
     print(
-        "提示: 同时观察 redis LLEN chat:flush:queue / ARQ 队列深度，以及 agent-worker 日志。"
+        "提示: 同时观察 redis LLEN room:flush:queue / ARQ 队列深度，以及 agent-worker 日志。"
     )
 
 
