@@ -45,17 +45,17 @@ logger = logging.getLogger(__name__)
 
 def _get_cors_origins() -> list[str]:
     """优化后的CORS配置：优先从环境变量读取，支持生产域名。推荐在.env中设置CORS_ORIGINS=https://yourdomain.com,https://admin.yourdomain.com"""
-    raw = os.getenv("CORS_ORIGINS", "").strip()
-    if raw:
-        origins = [item.strip() for item in raw.split(",") if item.strip()]
-        if origins:
-            logger.info("CORS origins from env: %s", origins)
-            return origins
-    # 默认开发端口 + 常见生产建议（生产环境请通过环境变量覆盖，避免使用通配符*以保持安全）
-    defaults = ["http://localhost:5173", "http://localhost:5174", "http://127.0.0.1:5173", "http://localhost:8000"]
-    logger.info("Using default CORS origins (set CORS_ORIGINS env for production): %s", defaults)
-    return defaults
-
+    # raw = os.getenv("CORS_ORIGINS", "").strip()
+    # if raw:
+    #     origins = [item.strip() for item in raw.split(",") if item.strip()]
+    #     if origins:
+    #         logger.info("CORS origins from env: %s", origins)
+    #         return origins
+    # # 默认开发端口 + 常见生产建议（生产环境请通过环境变量覆盖，避免使用通配符*以保持安全）
+    # defaults = ["http://localhost:5173", "http://localhost:5174", "http://127.0.0.1:5173", "http://localhost:8000"]
+    # logger.info("Using default CORS origins (set CORS_ORIGINS env for production): %s", defaults)
+    # return defaults
+    return ["*"]
 
 async def _moment_scheduler():
     """后台任务：每小时检查一次，随机为 AI 伴侣生成朋友圈和互动评论"""
@@ -262,7 +262,7 @@ async def generic_exception_handler(request: Request, exc: Exception):
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_get_cors_origins(),
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
