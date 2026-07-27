@@ -70,7 +70,7 @@ class CompanionORM(Base):
     name = Column(String(20), nullable=False)
     age = Column(Integer)
     gender = Column(String(2))
-    city = Column(String(20))
+    city = Column(String(64))
     personality = Column(Text)
     background = Column(Text)
     speech_style = Column(Text)
@@ -88,6 +88,9 @@ class CompanionORM(Base):
     avatar_url = Column(Text, default="")
     created_by = Column(String(64), default="")
     language = Column(String(10), default="zh")
+    persona_axes = Column(Text, default="")
+    country = Column(String(8), default="")
+    region_key = Column(String(32), default="")
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 
@@ -132,12 +135,23 @@ class FactORM(Base):
     __tablename__ = "facts"
     id = Column(Integer, primary_key=True, autoincrement=True)
     companion_id = Column(String(8), nullable=False, index=True)
+    # 按用户隔离事实；NULL 表示历史未隔离数据
+    user_id = Column(Integer, nullable=True, index=True)
     fact = Column(Text)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 
 class RelationSummaryORM(Base):
     __tablename__ = "relation_summaries"
+    companion_id = Column(String(8), primary_key=True)
+    summary = Column(Text, default="")
+    turns_since_update = Column(Integer, default=0)
+
+
+class UserRelationSummaryORM(Base):
+    """按用户隔离的关系摘要（替代仅 companion 级的 relation_summaries）。"""
+    __tablename__ = "user_relation_summaries"
+    user_id = Column(Integer, primary_key=True)
     companion_id = Column(String(8), primary_key=True)
     summary = Column(Text, default="")
     turns_since_update = Column(Integer, default=0)
@@ -453,6 +467,9 @@ def init_db():
     _ensure_column("companions", "avatar_url", "TEXT")
     _ensure_column("companions", "created_by", "VARCHAR(64) DEFAULT ''")
     _ensure_column("companions", "language", "VARCHAR(10) DEFAULT 'zh'")
+    _ensure_column("companions", "persona_axes", "TEXT DEFAULT ''")
+    _ensure_column("companions", "country", "VARCHAR(8) DEFAULT ''")
+    _ensure_column("companions", "region_key", "VARCHAR(32) DEFAULT ''")
     _ensure_column("posts", "category", "VARCHAR(50) DEFAULT ''")
     # 兼容：moment_comments 表新增 user_device_id 字段
     _ensure_column("moment_comments", "user_device_id", "VARCHAR(64)")
@@ -476,6 +493,9 @@ def init_db():
     _ensure_column("config_groups", "config_json", "TEXT DEFAULT '{}'")
     # REQ-A2：短期记忆按用户隔离
     _ensure_column("short_term_messages", "user_id", "INTEGER")
+    # 长期事实按用户隔离
+    _ensure_column("facts", "user_id", "INTEGER")
+    _alter_column_length("companions", "city", "VARCHAR(64)")
     # REQ-B1：关系卡落库列
     _ensure_column("user_companion_states", "relation_card_json", "TEXT")
     _ensure_column("user_companion_states", "relation_card_version", "INTEGER DEFAULT 0")

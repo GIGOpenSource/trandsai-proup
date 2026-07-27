@@ -289,8 +289,21 @@ async def api_delete_post(
 @router.post("/api/upload/image")
 async def api_upload_image(
     file: UploadFile = File(...),
+    x_token: Optional[str] = Header(None, alias="x-token"),
+    authorization: Optional[str] = Header(None),
 ):
-    """上传图片，返回可访问的 URL"""
+    """上传图片，返回可访问的 URL（需用户登录或管理员 Token）"""
+    user = _get_user_from_token(x_token)
+    admin_ok = False
+    if authorization and authorization.startswith("Bearer "):
+        try:
+            from api.auth import verify_token
+            admin_ok = bool(verify_token(authorization[7:].strip()))
+        except Exception:
+            admin_ok = False
+    if not user and not admin_ok:
+        raise HTTPException(status_code=401, detail="请先登录后再上传图片")
+
     ALLOWED_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
     MAX_SIZE = 5 * 1024 * 1024  # 5MB
 

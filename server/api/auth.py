@@ -98,13 +98,16 @@ def verify_token(token: str) -> bool:
 # ===== 用户 Token（数据库存储，7天有效，服务器重启不丢失）=====
 
 def create_user_token(user_id: int) -> str:
-    """为用户生成 7 天有效 Token，并持久化到数据库"""
-    token = _hash_token(f"user_{user_id}_{time.time()}")
+    """为用户生成 7 天有效 Token（高熵），并作废旧 Token。"""
+    token = secrets.token_urlsafe(32)
     expire = datetime.now(timezone.utc) + timedelta(days=7)
     from core.database import get_db, UserORM
     with get_db() as db:
         user = db.query(UserORM).filter(UserORM.id == user_id).first()
         if user:
+            old_token = (user.token or "").strip()
+            if old_token and old_token != token:
+                invalidate_user_token_cache(old_token)
             user.token = token
             user.token_expire = expire
             db.commit()
@@ -357,39 +360,55 @@ async def user_logout(x_token: Optional[str] = Header(None)):
 
 def _compute_user_stats(user_id: Optional[int]) -> dict:
     from datetime import datetime, timezone
+    from core.database import UserCompanionStateORM
+
+    if not user_id:
+        return {"companion_count": 0, "total_turns": 0, "days_together": 0}
 
     with get_db() as db:
-        companions = db.query(CompanionORM).all()
-        companion_count = len(companions)
+        user = db.query(UserORM).filter(UserORM.id == user_id).first()
+        if not user:
+            return {"companion_count": 0, "total_turns": 0, "days_together": 0}
+
+        uid_str = str(user_id)
+        username = (user.username or "").strip()
+        # 仅按 user_id / 唯一 username 归属（不再用可撞车的 nickname）
+        owned = []
+        for c in db.query(CompanionORM).all():
+            cb = (c.created_by or "").strip()
+            if cb == uid_str or (username and cb == username):
+                owned.append(c)
+        companion_count = len(owned)
+        companion_ids = [c.id for c in owned]
 
         total_turns = 0
-        for c in companions:
-            state = db.query(CompanionStateORM).filter(
-                CompanionStateORM.companion_id == c.id
-            ).first()
-            if state:
-                total_turns += state.turns or 0
+        if companion_ids:
+            user_states = (
+                db.query(UserCompanionStateORM)
+                .filter(
+                    UserCompanionStateORM.user_id == user_id,
+                    UserCompanionStateORM.companion_id.in_(companion_ids),
+                )
+                .all()
+            )
+            by_cid = {r.companion_id: (r.turns or 0) for r in user_states}
+            missing = [cid for cid in companion_ids if cid not in by_cid]
+            if missing:
+                for st in (
+                    db.query(CompanionStateORM)
+                    .filter(CompanionStateORM.companion_id.in_(missing))
+                    .all()
+                ):
+                    by_cid[st.companion_id] = st.turns or 0
+            total_turns = sum(by_cid.values())
 
         days_together = 0
-        if user_id:
-            user = db.query(UserORM).filter(UserORM.id == user_id).first()
-            if user and user.created_at:
-                now = datetime.now(timezone.utc)
-                created = user.created_at
-                if created.tzinfo is None:
-                    created = created.replace(tzinfo=timezone.utc)
-                days_together = max(1, (now - created).days)
-        elif companions:
-            earliest = None
-            for c in companions:
-                if c.created_at:
-                    if earliest is None or c.created_at < earliest:
-                        earliest = c.created_at
-            if earliest:
-                now = datetime.now(timezone.utc)
-                if earliest.tzinfo is None:
-                    earliest = earliest.replace(tzinfo=timezone.utc)
-                days_together = max(1, (now - earliest).days)
+        if user.created_at:
+            now = datetime.now(timezone.utc)
+            created = user.created_at
+            if created.tzinfo is None:
+                created = created.replace(tzinfo=timezone.utc)
+            days_together = max(1, (now - created).days)
 
     return {
         "companion_count": companion_count,
@@ -400,6 +419,8 @@ def _compute_user_stats(user_id: Optional[int]) -> dict:
 
 @router.get("/api/users/stats")
 async def user_stats(x_token: Optional[str] = Header(None)):
-    """获取用户统计数据（伴侣数、总对话轮数、陪伴天数）"""
+    """获取当前登录用户的统计（伴侣数、本人对话轮数、陪伴天数）"""
     user_id = verify_user_token(x_token) if x_token else None
+    if not user_id:
+        raise HTTPException(status_code=401, detail="未登录或Token已过期")
     return await run_rest(_compute_user_stats, user_id)

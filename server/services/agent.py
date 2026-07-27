@@ -6,7 +6,6 @@ from typing import Any, Dict, List, Optional
 from core.i18n import normalize_ui_language
 from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
-from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END, StateGraph
 from typing_extensions import TypedDict
@@ -53,8 +52,8 @@ def get_llm(
         elif role == "archive":
             provider = os.getenv("ARCHIVE_MODEL_PROVIDER") or os.getenv("MODEL_PROVIDER_ARCHIVE") or cfg.get("archive_provider")
         if not provider:
-            provider = cfg.get("model_provider") or os.getenv("MODEL_PROVIDER", "google")
-    provider = (provider or "google").lower()
+            provider = cfg.get("model_provider") or os.getenv("MODEL_PROVIDER", "anthropic")
+    provider = (provider or "anthropic").lower()
     # C5：未显式指定 Inner/Archive provider 时，把 anthropic 降到 flash 档
     explicit_role_provider = None
     if role == "inner":
@@ -87,17 +86,6 @@ def get_llm(
         openai_extra["frequency_penalty"] = freq_pen
     if pres_pen:
         openai_extra["presence_penalty"] = pres_pen
-
-    if provider == "google":
-        api_key = _override_or_env("google_key", "GOOGLE_API_KEY")
-        if not api_key:
-            raise RuntimeError("请设置 GOOGLE_API_KEY")
-        return ChatGoogleGenerativeAI(
-            model="gemini-2.5-flash-lite",
-            temperature=temperature,
-            max_tokens=max_tokens,
-            google_api_key=api_key,
-        )
 
     if provider == "deepseek":
         api_key = _override_or_env("deepseek_key", "DEEPSEEK_API_KEY")

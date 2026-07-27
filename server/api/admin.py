@@ -1091,13 +1091,16 @@ _BATCH_PERSONA_PROMPT = """你是一个专业的人物设定作家。请根据�
 
 要求（必须严格遵守，确保地区、语言与上表基础信息高度一致）：
 1. 每个角色的内容必须和其基础信息（姓名、年龄、性别、城市、性格、MBTI）高度一致，不得写成与**城市/姓名文化圈**不符的海外架空背景，除非上表能支撑
-2. 内容要口语化、有画面感、真实可信、生动具体，不要模板化或泛泛而谈
-3. 成长经历（life_story）必须包含：童年、青少年、成年、原生家庭影响、重大转折点、具体事件；并写明与当前城市的关系（土生土长/迁入等）
-4. 文化三观（cultural_values）必须因果自洽：成长经历事件 → 当前立场；当前城市主流文化/语言 → 如何强化该立场；默认贴合当地主流，非主流须用经历解释
-5. **所有字段必须完整填充**，不能为空、占位符或过短，必须达到括号指定的字数，使用丰富细节、个人故事、具体例子使人物立体有血有肉
-6. 输出语言与内容一致性（极其重要，违反则视为错误输出）：
+2. 内容要口语化、有画面感、真实可信、生动具体；禁止模板化脚手架；同批角色的职业/爱好/转折点必须彼此区分，禁止批量复制同一套「奶茶地铁」或「投行红酒」套路
+3. **性格标签必须被消化**：每位角色的 speech_style / love_view / fears / hobbies / life_story 都要能看出其「性格」字段的具体行为；禁止无视种子写成通用温柔伴侣
+4. **禁止默认少女腔**：角色可为任意性别气质；男性或硬朗标签时禁止默认撒娇软萌；女性也不必写成「标准女友」模板
+5. 成长经历（life_story）必须包含：童年、青少年、成年、原生家庭影响、重大转折点、具体事件；并写明与当前城市的关系（土生土长/迁入等）；避免同义反复的脚手架长段
+6. 文化三观（cultural_values）必须因果自洽：成长经历事件 → 当前立场；当前城市主流文化/语言 → 如何强化该立场；默认贴合当地主流，非主流须用经历解释；城市日常须按该城差异化，禁止整语种共用一段空话
+7. **所有字段必须完整填充**，不能为空、占位符或过短，必须达到括号指定的字数，使用丰富细节、个人故事、具体例子使人物立体有血有肉
+8. 输出语言与内容一致性（极其重要，违反则视为错误输出）：
 {output_instruction}
-7. JSON 必须有效，每个字段都是独立、连贯的段落文本
+9. JSON 必须有效，每个字段都是独立、连贯的段落文本
+10. **人设维度种子必须落地**：每位角色若带有职业阶层/依恋/冲突/节奏/兴趣域，须写入职业、亲密反应、吵架方式、作息与爱好；同批同 MBTI 也必须因此明显不同
 
 {locale_banner}
 
@@ -1162,12 +1165,21 @@ async def _batch_generate_companions_core(data: dict):
     lang = normalize_batch_generation_lang(data.get("lang", "zh"))
     gender = data.get("gender")
     sexual_orientation = data.get("sexual_orientation")
+    region_key = data.get("region") or data.get("region_key")
+    country = data.get("country")
 
     # 限制范围，支持最多50个以满足需求
     count = max(1, min(count, 50))
 
     # 生成基础属性（姓名/城市/性格与 lang 同文化圈一致）
-    base_profiles = build_batch_profiles(lang, count, gender=gender, sexual_orientation=sexual_orientation)
+    base_profiles = build_batch_profiles(
+        lang,
+        count,
+        gender=gender,
+        sexual_orientation=sexual_orientation,
+        region_key=region_key,
+        country=country,
+    )
 
     cultural_context = get_cultural_context(lang) + (
         "\n\n【意识形态强制 — 每个角色各自适用】"
@@ -1192,10 +1204,12 @@ async def _batch_generate_companions_core(data: dict):
             f"- 姓名: {p['name']}\n"
             f"- 年龄: {p['age']}\n"
             f"- 性别: {p['gender']}\n"
+            f"- 国家/地区: {p.get('region_label') or p.get('country') or ''}\n"
             f"- 城市: {p['city']}\n"
             f"- 性格: {p['personality']}\n"
             f"- MBTI: {p['mbti']}\n"
-            f"- 性取向: {p['sexual_orientation']}"
+            f"- 性取向: {p['sexual_orientation']}\n"
+            f"- 人设维度:\n{p.get('persona_axes_summary') or '（未提供）'}"
             for i, p in enumerate(batch)
         )
 
@@ -1254,9 +1268,12 @@ async def _batch_generate_companions_core(data: dict):
                         "gender": base["gender"],
                         "age": base["age"],
                         "city": base["city"],
+                        "country": base.get("country") or "",
+                        "region_key": base.get("region_key") or "",
                         "personality": base["personality"],
                         "mbti": base["mbti"],
                         "sexual_orientation": base["sexual_orientation"],
+                        "persona_axes": base.get("persona_axes") or {},
                         "background": background,
                         "speech_style": speech_style,
                         "hobbies": gen.get("hobbies") or "",

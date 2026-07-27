@@ -18,6 +18,7 @@ from sqlalchemy import desc
 from core.database import (
     FactORM,
     RelationSummaryORM,
+    UserRelationSummaryORM,
     ShortTermMessageORM,
     get_db,
 )
@@ -506,15 +507,21 @@ class ShortTermMemory:
 
 # ===== EpisodicMemory (Chroma 向量) =====
 class EpisodicMemory:
-    """向量情节记忆：Chroma 存储，按智能体隔离 collection"""
+    """向量情节记忆：Chroma 存储；有 user_id 时按用户分 collection。"""
 
-    def __init__(self, companion_id: str, companion_dir: str):
+    def __init__(self, companion_id: str, companion_dir: str, user_id: Optional[int] = None):
         self.companion_id = companion_id
+        self.user_id = user_id
         self.persist_dir = os.path.join(companion_dir, "chroma")
         os.makedirs(self.persist_dir, exist_ok=True)
         self.client = get_persistent_client(self.persist_dir)
+        coll_name = (
+            f"companion_{companion_id}_u{user_id}"
+            if user_id is not None
+            else f"companion_{companion_id}"
+        )
         self.collection = self.client.get_or_create_collection(
-            name=f"companion_{companion_id}",
+            name=coll_name,
             metadata={"hnsw:space": "cosine"},
         )
 
@@ -525,6 +532,8 @@ class EpisodicMemory:
         doc_id = str(uuid.uuid4())
         meta = metadata or {}
         meta["timestamp"] = datetime.now(timezone.utc).isoformat()
+        if self.user_id is not None:
+            meta["user_id"] = int(self.user_id)
         self.collection.add(
             ids=[doc_id],
             embeddings=[embedding],
@@ -565,32 +574,36 @@ class EpisodicMemory:
 
 # ===== FactMemory (PostgreSQL) =====
 class FactMemory:
-    """结构化事实记忆：PostgreSQL 存储"""
+    """结构化事实记忆：按 companion + user 隔离（user_id 为空时兼容历史 companion 级）。"""
 
-    def __init__(self, companion_id: str):
+    def __init__(self, companion_id: str, user_id: Optional[int] = None):
         self.companion_id = companion_id
+        self.user_id = user_id
+
+    def _fact_query(self, db):
+        q = db.query(FactORM).filter(FactORM.companion_id == self.companion_id)
+        if self.user_id is not None:
+            q = q.filter(FactORM.user_id == self.user_id)
+        else:
+            q = q.filter(FactORM.user_id.is_(None))
+        return q
 
     def add_facts(self, new_facts: List[str]):
         with get_db() as db:
-            existing = {
-                f.fact for f in db.query(FactORM).filter(
-                    FactORM.companion_id == self.companion_id
-                ).all()
-            }
+            existing = {f.fact for f in self._fact_query(db).all()}
             for fact in new_facts:
                 fact = fact.strip()
                 if fact and fact not in existing:
-                    db.add(FactORM(companion_id=self.companion_id, fact=fact))
+                    db.add(FactORM(
+                        companion_id=self.companion_id,
+                        user_id=self.user_id,
+                        fact=fact,
+                    ))
                     existing.add(fact)
 
     def get_facts(self) -> List[str]:
         with get_db() as db:
-            rows = (
-                db.query(FactORM)
-                .filter(FactORM.companion_id == self.companion_id)
-                .order_by(FactORM.id)
-                .all()
-            )
+            rows = self._fact_query(db).order_by(FactORM.id).all()
             return [r.fact for r in rows]
 
     def to_text(self, max_items: int = 20) -> str:
@@ -601,13 +614,35 @@ class FactMemory:
 
 # ===== RelationSummary (PostgreSQL) =====
 class RelationSummary:
-    """关系摘要：每 8 轮自动更新一句温馨摘要"""
+    """关系摘要：有 user_id 时写入 user_relation_summaries，否则回退旧表。"""
 
-    def __init__(self, companion_id: str):
+    def __init__(self, companion_id: str, user_id: Optional[int] = None):
         self.companion_id = companion_id
+        self.user_id = user_id
 
     def _get_row(self) -> dict:
         with get_db() as db:
+            if self.user_id is not None:
+                row = (
+                    db.query(UserRelationSummaryORM)
+                    .filter(
+                        UserRelationSummaryORM.user_id == self.user_id,
+                        UserRelationSummaryORM.companion_id == self.companion_id,
+                    )
+                    .first()
+                )
+                if not row:
+                    row = UserRelationSummaryORM(
+                        user_id=self.user_id,
+                        companion_id=self.companion_id,
+                    )
+                    db.add(row)
+                    db.commit()
+                    db.refresh(row)
+                return {
+                    "summary": row.summary,
+                    "turns_since_update": row.turns_since_update,
+                }
             row = (
                 db.query(RelationSummaryORM)
                 .filter(RelationSummaryORM.companion_id == self.companion_id)
@@ -618,7 +653,6 @@ class RelationSummary:
                 db.add(row)
                 db.commit()
                 db.refresh(row)
-            # 在 session 内提取值，避免 detached instance 错误
             return {
                 "summary": row.summary,
                 "turns_since_update": row.turns_since_update,
@@ -630,6 +664,26 @@ class RelationSummary:
 
     def update(self, new_summary: str):
         with get_db() as db:
+            if self.user_id is not None:
+                row = (
+                    db.query(UserRelationSummaryORM)
+                    .filter(
+                        UserRelationSummaryORM.user_id == self.user_id,
+                        UserRelationSummaryORM.companion_id == self.companion_id,
+                    )
+                    .first()
+                )
+                if row:
+                    row.summary = new_summary.strip()
+                    row.turns_since_update = 0
+                else:
+                    db.add(UserRelationSummaryORM(
+                        user_id=self.user_id,
+                        companion_id=self.companion_id,
+                        summary=new_summary.strip(),
+                        turns_since_update=0,
+                    ))
+                return
             row = (
                 db.query(RelationSummaryORM)
                 .filter(RelationSummaryORM.companion_id == self.companion_id)
@@ -647,6 +701,24 @@ class RelationSummary:
 
     def increment_turn(self):
         with get_db() as db:
+            if self.user_id is not None:
+                row = (
+                    db.query(UserRelationSummaryORM)
+                    .filter(
+                        UserRelationSummaryORM.user_id == self.user_id,
+                        UserRelationSummaryORM.companion_id == self.companion_id,
+                    )
+                    .first()
+                )
+                if row:
+                    row.turns_since_update = (row.turns_since_update or 0) + 1
+                else:
+                    db.add(UserRelationSummaryORM(
+                        user_id=self.user_id,
+                        companion_id=self.companion_id,
+                        turns_since_update=1,
+                    ))
+                return
             row = (
                 db.query(RelationSummaryORM)
                 .filter(RelationSummaryORM.companion_id == self.companion_id)
@@ -674,15 +746,18 @@ class CompanionMemory:
         self.companion_dir = companion_dir
         self.short_term = ShortTermMemory(companion_id)
         self.episodic = EpisodicMemory(companion_id, companion_dir)
-        self.facts = FactMemory(companion_id)  # 本版仍 companion 级；私密隔离属后续 ADR
+        self.facts = FactMemory(companion_id)
         self.summary = RelationSummary(companion_id)
 
     def bind_user(self, user_id: Optional[int]) -> None:
-        """将短期记忆绑定到会话用户（WS 必调）。"""
+        """将短/长记忆绑定到会话用户（WS 必调）。"""
         current = getattr(self.short_term, "user_id", None)
-        if current == user_id:
+        if current == user_id and getattr(self.facts, "user_id", None) == user_id:
             return
         self.short_term = ShortTermMemory(self.companion_id, user_id=user_id)
+        self.episodic = EpisodicMemory(self.companion_id, self.companion_dir, user_id=user_id)
+        self.facts = FactMemory(self.companion_id, user_id=user_id)
+        self.summary = RelationSummary(self.companion_id, user_id=user_id)
 
     def add_user_message(self, content: str):
         self.short_term.add("user", content)
@@ -711,17 +786,23 @@ class CompanionMemory:
 
     def get_context(self, query: str = "", user_id: Optional[int] = None) -> Dict[str, Any]:
         short = self.short_term
+        facts = self.facts
+        summary = self.summary
+        episodic = self.episodic
         if user_id is not None and short.user_id != user_id:
             short = ShortTermMemory(self.companion_id, user_id=user_id)
+            facts = FactMemory(self.companion_id, user_id=user_id)
+            summary = RelationSummary(self.companion_id, user_id=user_id)
+            episodic = EpisodicMemory(self.companion_id, self.companion_dir, user_id=user_id)
         recent = short.get_recent(MEMORY_RECENT_MESSAGES)
         episodes = []
         if query:
-            episodes = self.episodic.search(query, top_k=5)
+            episodes = episodic.search(query, top_k=5)
         return {
             "recent_dialogue": recent,
             "episodes": episodes,
-            "facts": self.facts.get_facts(),
-            "summary": self.summary.get_summary(),
+            "facts": facts.get_facts(),
+            "summary": summary.get_summary(),
             "_short_term": short,
         }
 

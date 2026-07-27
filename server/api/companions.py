@@ -5,13 +5,14 @@ import logging
 import os
 import random
 import re
+import time
 import uuid
 from datetime import datetime, timezone
+from typing import Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, Depends, Header, HTTPException, WebSocket, WebSocketDisconnect
 from langchain_core.messages import SystemMessage
 from starlette.websockets import WebSocketState
-from typing import List, Optional, Tuple
 
 from api.auth import verify_user_token
 from core.concurrency import agent_semaphore, heavy_load_ratio, user_turn_lock
@@ -34,6 +35,8 @@ from services.agent_runner import run_agent, run_memory_update_async
 from services.agent import get_llm
 from services.llm.client import llm_invoke
 from services.culture_data import get_cultural_context_for_city, default_cultural_values, infer_language_from_city
+from services.persona_axes import axes_prompt_block, resolve_axes_from_payload, sample_persona_axes
+from services.region_catalog import find_region_for_city
 from services.memory import normalize_message_text_for_dedup
 from services.image_generation import generate_avatar_prompt, generate_image_with_cache
 from core.i18n import (
@@ -92,7 +95,166 @@ def _log_chat_turn(payload: dict) -> None:
 # 单次从 WS 队列合并处理的用户消息条数上限：避免一次合并过多导致模型/记忆语义「串」、且 empty() 在竞态下不可靠
 _WS_BURST_MAX_MESSAGES = 10
 
+# 空闲 WS 应用层心跳：须明显小于 nginx proxy_read_timeout（现为 300s）
+_WS_IDLE_HEARTBEAT_MIN_S = float(os.getenv("WS_IDLE_HEARTBEAT_MIN_S", "25") or 25)
+_WS_IDLE_HEARTBEAT_MAX_S = float(os.getenv("WS_IDLE_HEARTBEAT_MAX_S", "45") or 45)
+_WS_PROACTIVE_SLEEP_CHUNK_S = float(os.getenv("WS_PROACTIVE_SLEEP_CHUNK_S", "30") or 30)
+# 发出 ping 后等待 pong 的上限；超时视为僵死连接并主动关闭
+_WS_PONG_TIMEOUT_S = float(os.getenv("WS_PONG_TIMEOUT_S", "90") or 90)
+# 后台清扫间隔：扫描无 pong 应答的注册连接
+_WS_ZOMBIE_SWEEP_S = float(os.getenv("WS_ZOMBIE_SWEEP_S", "30") or 30)
+
 _DELIVERY_DELAY_FACTOR = float(os.getenv("DELIVERY_DELAY_FACTOR", "0.6"))
+
+# connection_id -> WebSocket；供僵尸清扫主动 close，释放协程与连接槽位
+_ws_live_registry: Dict[str, WebSocket] = {}
+_ws_janitor_lock = asyncio.Lock()
+_ws_janitor_task: Optional[asyncio.Task] = None
+
+
+def _ws_heartbeat_interval() -> float:
+    lo = max(5.0, min(_WS_IDLE_HEARTBEAT_MIN_S, _WS_IDLE_HEARTBEAT_MAX_S))
+    hi = max(lo, _WS_IDLE_HEARTBEAT_MAX_S)
+    return random.uniform(lo, hi)
+
+
+def _ws_mark_alive(websocket: WebSocket) -> None:
+    """任意入站帧（含 pong / 业务消息）刷新存活时间。"""
+    now = time.monotonic()
+    setattr(websocket, "_trandsai_last_pong_at", now)
+    setattr(websocket, "_trandsai_awaiting_pong", False)
+
+
+def _ws_note_ping_sent(websocket: WebSocket) -> None:
+    now = time.monotonic()
+    setattr(websocket, "_trandsai_ping_sent_at", now)
+    setattr(websocket, "_trandsai_awaiting_pong", True)
+
+
+def _ws_is_zombie(websocket: WebSocket) -> bool:
+    """已发 ping 且超过 WS_PONG_TIMEOUT_S 仍无 pong/入站 → 僵死。"""
+    if not getattr(websocket, "_trandsai_awaiting_pong", False):
+        return False
+    ping_at = float(getattr(websocket, "_trandsai_ping_sent_at", 0) or 0)
+    if ping_at <= 0:
+        return False
+    return (time.monotonic() - ping_at) >= max(30.0, _WS_PONG_TIMEOUT_S)
+
+
+async def _ws_force_close(websocket: WebSocket, *, reason: str = "zombie") -> None:
+    """主动关闭失效 WS，释放 Nginx/Uvicorn 连接槽。"""
+    try:
+        logger.info("WS force-close (%s) state=%s", reason, getattr(websocket, "client_state", None))
+        if websocket.client_state == WebSocketState.CONNECTED:
+            await websocket.close(code=1001)
+    except Exception as e:
+        logger.debug("WS force-close ignored: %s", e)
+
+
+def _ws_register(connection_id: str, websocket: WebSocket) -> None:
+    _ws_live_registry[connection_id] = websocket
+    now = time.monotonic()
+    setattr(websocket, "_trandsai_connection_id", connection_id)
+    setattr(websocket, "_trandsai_last_pong_at", now)
+    setattr(websocket, "_trandsai_awaiting_pong", False)
+    setattr(websocket, "_trandsai_ping_sent_at", 0.0)
+
+
+def _ws_unregister(connection_id: str) -> None:
+    _ws_live_registry.pop(connection_id, None)
+
+
+async def _ws_janitor_loop() -> None:
+    """定时扫描无 pong 的僵死连接并 close。"""
+    while True:
+        try:
+            await asyncio.sleep(max(10.0, _WS_ZOMBIE_SWEEP_S))
+            dead: List[str] = []
+            for cid, ws in list(_ws_live_registry.items()):
+                try:
+                    if ws.client_state != WebSocketState.CONNECTED:
+                        dead.append(cid)
+                        continue
+                    if _ws_is_zombie(ws):
+                        await _ws_force_close(ws, reason="janitor-no-pong")
+                        dead.append(cid)
+                except Exception:
+                    dead.append(cid)
+            for cid in dead:
+                _ws_unregister(cid)
+            if dead:
+                logger.warning(
+                    "WS janitor closed %s zombie connection(s); live=%s",
+                    len(dead),
+                    len(_ws_live_registry),
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("WS janitor loop error")
+
+
+async def _ensure_ws_janitor() -> None:
+    global _ws_janitor_task
+    async with _ws_janitor_lock:
+        if _ws_janitor_task is not None and not _ws_janitor_task.done():
+            return
+        _ws_janitor_task = asyncio.create_task(_ws_janitor_loop(), name="ws-zombie-janitor")
+
+
+async def _ws_send_json(websocket: WebSocket, payload: dict) -> bool:
+    """串行发送 JSON 帧（连接级 Lock），避免多协程并发 send_text 打坏连接。"""
+    lock = getattr(websocket, "_trandsai_send_lock", None)
+    if lock is None:
+        lock = asyncio.Lock()
+        setattr(websocket, "_trandsai_send_lock", lock)
+    try:
+        async with lock:
+            if websocket.client_state != WebSocketState.CONNECTED:
+                return False
+            await websocket.send_text(json.dumps(payload))
+            return True
+    except Exception:
+        return False
+
+
+async def _ws_send_ping_or_close(websocket: WebSocket) -> bool:
+    """
+    空闲心跳：若上一轮 ping 已超时无 pong，则关闭僵死连接并返回 False；
+    否则下发 ping 并标记等待 pong。返回 False 表示应结束主循环。
+    """
+    if _ws_is_zombie(websocket):
+        await _ws_force_close(websocket, reason="missed-pong")
+        return False
+    if not await _ws_send_json(websocket, {"type": "ping"}):
+        return False
+    _ws_note_ping_sent(websocket)
+    return True
+
+
+async def _sleep_with_ws_keepalive(
+    websocket: WebSocket, total_seconds: float, *, chunk_seconds: Optional[float] = None
+) -> bool:
+    """
+    长等待切成短片断。片间不再额外 ping（主循环空闲心跳已覆盖），仅检测连接仍可用。
+    返回 False 表示连接已不可用。
+    """
+    remaining = max(0.0, float(total_seconds))
+    chunk = float(chunk_seconds if chunk_seconds is not None else _WS_PROACTIVE_SLEEP_CHUNK_S)
+    chunk = max(5.0, chunk)
+    while remaining > 0:
+        step = min(chunk, remaining)
+        await asyncio.sleep(step)
+        remaining -= step
+        if remaining <= 0:
+            break
+        if websocket.client_state != WebSocketState.CONNECTED:
+            return False
+        if _ws_is_zombie(websocket):
+            await _ws_force_close(websocket, reason="proactive-missed-pong")
+            return False
+    return websocket.client_state == WebSocketState.CONNECTED
+
 
 _AGENT_BUSY_MESSAGE = {
     "zh": "现在有点忙，稍后再聊～",
@@ -196,9 +358,12 @@ async def _send_plain_assistant_bubble(
                 else:
                     skip = random.random() < 0.88
     if not skip:
-        await websocket.send_text(
-            json.dumps({"type": "message", "role": "assistant", "text": display_text})
+        ok = await _ws_send_json(
+            websocket,
+            {"type": "message", "role": "assistant", "text": display_text},
         )
+        if not ok:
+            return ""
     return "" if skip else display_text
 
 
@@ -207,10 +372,7 @@ async def _keepalive_during_agent(websocket: WebSocket, agent_task, language: st
     n = 0
     while not agent_task.done():
         n += 1
-        try:
-            if websocket.client_state == WebSocketState.CONNECTED:
-                await websocket.send_text(json.dumps({"type": "typing"}))
-        except Exception:
+        if not await _ws_send_json(websocket, {"type": "typing"}):
             return
         try:
             wait = 1.85 if n < 4 else 2.35
@@ -260,9 +422,10 @@ async def _deliver_assistant_content(
             if len(inner) > _THINK_TOAST_WS_MAX:
                 inner = inner[: _THINK_TOAST_WS_MAX - 1] + "…"
             try:
-                await websocket.send_text(
-                    json.dumps({"type": "toast", "text": f"💭 {inner}"})
-                )
+                if not await _ws_send_json(
+                    websocket, {"type": "toast", "text": f"💭 {inner}"}
+                ):
+                    return sent_segments, True
             except Exception:
                 return sent_segments, True
             think_toast_sent = True
@@ -296,9 +459,7 @@ async def _deliver_assistant_content(
                 else:
                     skip_typing = random.random() < 0.32
                 if not skip_typing:
-                    try:
-                        await websocket.send_text(json.dumps({"type": "typing"}))
-                    except Exception:
+                    if not await _ws_send_json(websocket, {"type": "typing"}):
                         return sent_segments, True
                 if await _interrupted():
                     return sent_segments, True
@@ -321,26 +482,37 @@ async def require_login_user(
     return uid
 
 
-def _assert_companion_user_access(companion, user_id: int) -> None:
-    """验证用户是否有权访问该 companion。只有 created_by 匹配当前用户才能访问。"""
+def _assert_companion_readable(companion, user_id: int) -> None:
+    """登录用户可查看/聊天任意已存在智能体（业务：可见并互动别人创建的智能体）。"""
+    if user_id is None:
+        raise HTTPException(status_code=401, detail="请先登录")
+    if not companion:
+        raise HTTPException(status_code=404, detail="智能体不存在")
+
+
+def _assert_companion_owner(companion, user_id: int) -> None:
+    """仅创建者可执行删除/重生头像等写操作。
+    归属匹配 user_id 或唯一 username；不用 nickname（可撞车导致误授权）。
+    """
+    if not companion:
+        raise HTTPException(status_code=404, detail="智能体不存在")
     cb = (companion.profile.created_by or "").strip()
-
-    # 必须有 created_by 且匹配当前用户
     if not cb:
-        raise HTTPException(status_code=403, detail="无权访问该智能体")
-
+        raise HTTPException(status_code=403, detail="无权操作该智能体")
     if cb == str(user_id):
         return
-
     with get_db() as db:
         user = db.query(UserORM).filter(UserORM.id == user_id).first()
         if user:
-            nick = (user.nickname or "").strip()
             uname = (user.username or "").strip()
-            if cb == nick or cb == uname:
+            if uname and cb == uname:
                 return
+    raise HTTPException(status_code=403, detail="无权操作该智能体")
 
-    raise HTTPException(status_code=403, detail="无权访问该智能体")
+
+# 兼容旧名：读路径语义改为「可读」
+def _assert_companion_user_access(companion, user_id: int) -> None:
+    _assert_companion_readable(companion, user_id)
 
 
 # ===== 主动消息相关 =====
@@ -521,19 +693,22 @@ Persyaratan:
 {restriction_text}"""
 
 
-async def _send_proactive_message(websocket: WebSocket, companion, lang: str, companion_id: str):
+async def _send_proactive_message(websocket: WebSocket, companion, lang: str, companion_id: str, user_id: int = None):
     """定时发送主动消息（C3：信息量门槛）。"""
     try:
         mult = float(os.getenv("PROACTIVE_LOAD_MULTIPLIER", "1.0") or 1.0)
         if heavy_load_ratio() > 0.8:
             mult = max(mult, 2.0)
-        await asyncio.sleep(random.uniform(90, 180) * mult)
+        wait_s = random.uniform(90, 180) * mult
+        # 长等待切段 + ping，避免 nginx/proxy 空闲超时
+        if not await _sleep_with_ws_keepalive(websocket, wait_s):
+            return
 
         # 检查连接是否仍然打开
         if websocket.client_state == WebSocketState.DISCONNECTED:
             return
 
-        sess = get_session(companion_id) or {}
+        sess = get_session(companion_id, user_id=user_id) or {}
         uid = sess.get("user_id")
         card = {}
         if RELATION_CARD_ENABLED and isinstance(uid, int):
@@ -554,9 +729,7 @@ async def _send_proactive_message(websocket: WebSocket, companion, lang: str, co
             logger.info("Skip proactive (%s) companion=%s", reason, companion_id)
             return
 
-        try:
-            await websocket.send_text(json.dumps({"type": "typing"}))
-        except Exception:
+        if not await _ws_send_json(websocket, {"type": "typing"}):
             return
 
         time_ctx = build_dialogue_time_context(
@@ -593,7 +766,7 @@ async def _send_proactive_message(websocket: WebSocket, companion, lang: str, co
         except Exception:
             return
 
-        sess_done = get_session(companion_id) or {}
+        sess_done = get_session(companion_id, user_id=user_id) or {}
         uid = sess_done.get("user_id")
         companion.save_state(uid if isinstance(uid, int) else None)
     except Exception as e:
@@ -608,27 +781,35 @@ _PERSONA_GENERATE_PROMPT = """你是一个专业的人物设定作家。请根�
 
 要求：
 1. 生成的内容必须和已知的基础信息（姓名、年龄、性别、城市、性格、MBTI）高度一致；城市决定生活环境与文化圈，禁止写成与该城市主流文化不符的另一国家/语言人生
-2. 内容要口语化、有画面感、真实可信，不要模板化
-3. 成长经历（life_story）必须包含：童年、青少年、成年、原生家庭影响、重大转折点、内心创伤与成长；须写明成长地/求学或打工环境与「当前城市」的关系（土生土长 / 迁入 / 两地往返等）；不少于 180 字
-4. 文化三观与意识形态（cultural_values）必须因果自洽，不少于 100 字，并写清：
+2. 内容要口语化、有画面感、真实可信，不要模板化；禁止复制「童年→求学→某年搬到某城→如今…」的空洞脚手架长段
+3. **性格标签必须被消化进全文**：speech_style / love_view / fears / hobbies / life_story 都要能看出给定性格（{personality}）的具体行为与语气；禁止无视种子写成「通用温柔体贴伴侣」
+4. **性别气质禁止默认少女腔**：角色可为任意性别气质（沉稳/硬核/寡言/社牛/毒舌/事业心等均可）。若性别为男或性格偏硬朗，禁止默认撒娇、黏人、软萌口癖；若性格含温柔，也须写成具体相处方式，而非「标准女友」模板
+5. 避开陈词滥调职业/爱好组合的堆砌（如：编辑+胡同散步+陶艺；投行+红酒+英短；咖啡店兼职+胶片相机等若无性格支撑则勿用）；兴趣与职业须与性格、城市、年龄互相解释
+6. 城市日常须差异化：使用「所在地主流文化锚点」里该城的 everyday / ideology，禁止整语种共用一段「奶茶+地铁+外卖」空话套到所有城市
+7. 成长经历（life_story）必须包含：童年、青少年、成年、原生家庭影响、重大转折点、内心创伤与成长；须写明成长地/求学或打工环境与「当前城市」的关系（土生土长 / 迁入 / 两地往返等）；不少于 180 字；段落之间要有因果，不要同义反复
+8. 文化三观与意识形态（cultural_values）必须因果自洽，不少于 100 字，并写清：
    - 价值排序（家庭/自由/成就/面子/金钱/忠诚等）
    - 对权威、个人自由、集体/社群的态度
    - 至少 2 条因果：成长经历中的具体事件或环境 → 当前立场；当前城市日常 → 如何强化或修正该立场
    - 默认贴合所在地主流文化与主流语言习惯；若有非主流观点，必须用成长经历解释，且仍用当地语言表达
-5. 性别观念与认知（gender_perspective）写清对性别角色、亲密关系中的平等与边界；须与当地主流社交习惯相容或给出经历解释；不少于 80 字
-6. 每个字段都要独立且非空；禁止省略后三个深度字段
-7. 控制总长度：除 life_story 外，其余字段各 40–180 字，避免超长导致 JSON 截断
-8. background / daily_routine / speech_style 必须能看出该城市的生活气味（通勤、媒介、饮食、社交场合），禁止全球通用空话
+9. 性别观念与认知（gender_perspective）写清对性别角色、亲密关系中的平等与边界；须与当地主流社交习惯相容或给出经历解释；不少于 80 字；不要默认「男性保护/女性被保护」刻板叙事，除非性格与经历明确支撑
+10. 每个字段都要独立且非空；禁止省略后三个深度字段
+11. 控制总长度：除 life_story 外，其余字段各 40–180 字，避免超长导致 JSON 截断
+12. background / daily_routine / speech_style 必须能看出该城市的生活气味（通勤、媒介、饮食、社交场合），且与性格标签同频
+13. **人设维度种子必须落地**：职业/收入节奏贴合 career_class；亲密关系反应贴合 attachment；吵架与和好方式贴合 conflict_style；作息与压力感贴合 life_pace；爱好与社交场合贴合 interest_domain。同 MBTI 也必须因这些种子而明显不同
+14. **用户草稿扩展（若提供）**：下方「用户已填写草稿」中的字段是用户原意，必须在对应字段上**扩写、润色、补全细节**，保留其核心事实与语气倾向；禁止无视草稿另起炉灶，禁止删掉用户明确写过的关键设定（职业、家庭、事件等）。未提供草稿的字段再自由创作，且须与草稿及基础信息自洽
 
 基础信息：
 - 姓名：{name}
 - 年龄：{age}
 - 性别：{gender}
 - 性取向：{sexual_orientation}
+- 国家/地区：{region_line}
 - 城市：{city}
 - 性格：{personality}
 - MBTI：{mbti}
-
+{axes_block}
+{user_draft_block}
 {cultural_context}
 
 请直接返回一个 JSON 对象，不要返回任何解释文字、不要 Markdown 代码块。
@@ -747,9 +928,41 @@ def _normalize_persona_result(result: dict, data: dict) -> dict:
     return out
 
 
+_PERSONA_DRAFT_KEYS = (
+    "background",
+    "speech_style",
+    "hobbies",
+    "values",
+    "fears",
+    "love_view",
+    "daily_routine",
+    "favorite_things",
+    "life_story",
+    "cultural_values",
+    "gender_perspective",
+)
+
+
+def _build_user_draft_block(data: dict) -> str:
+    """从请求中收集用户已填长文，供 Prompt 扩展完善。"""
+    lines = []
+    for key in _PERSONA_DRAFT_KEYS:
+        raw = data.get(key) or (data.get("user_draft") or {}).get(key)
+        text = str(raw or "").strip()
+        if text:
+            lines.append(f"- {key}: {text}")
+    if not lines:
+        return ""
+    return (
+        "\n用户已填写草稿（必须基于此扩展完善，勿推翻）：\n"
+        + "\n".join(lines)
+        + "\n"
+    )
+
+
 @router.post("/companions/generate")
 async def api_generate_persona(data: dict):
-    """根据基础信息 AI 自动生成完整人设"""
+    """根据基础信息 AI 自动生成完整人设；若带用户草稿字段则扩展完善。"""
     name = data.get("name", "")
     age = data.get("age", 22)
     gender = data.get("gender", "女")
@@ -775,11 +988,44 @@ async def api_generate_persona(data: dict):
 
     cultural_context = get_cultural_context_for_city(city, lang)
 
+    region_meta = find_region_for_city(city, lang) or {}
+    region_line = (
+        data.get("region_label")
+        or region_meta.get("label")
+        or data.get("country")
+        or region_meta.get("country")
+        or "（由城市推断）"
+    )
+    if data.get("country") or region_meta.get("country"):
+        cc = data.get("country") or region_meta.get("country")
+        if cc and cc not in str(region_line):
+            region_line = f"{region_line} ({cc})"
+
+    axes = resolve_axes_from_payload(data, lang)
+    # expand_user_input=True：强化「在用户草稿基础上扩写」指令
+    expand_flag = bool(data.get("expand_user_input"))
+    user_draft_block = _build_user_draft_block(data)
+    if expand_flag and not user_draft_block:
+        # 前端声明要扩展但未带长文：仍按种子生成，不报错
+        pass
+    if not axes:
+        axes = sample_persona_axes(lang)
+    axes_block = axes_prompt_block(axes, lang)
+    if expand_flag and user_draft_block:
+        axes_block = (
+            axes_block
+            + "\n\n【扩展模式】用户已提供草稿长文。请在保留其事实/语气/关键短语的前提下扩写润色，"
+            "禁止整段另起炉灶；输出中须能看出原草稿痕迹。"
+        )
+
     prompt = _PERSONA_GENERATE_PROMPT.format(
         name=name, age=age, gender=gender,
         sexual_orientation=orientation_label or "未指定",
+        region_line=region_line,
         city=city,
         personality=personality, mbti=mbti or "未知",
+        axes_block=axes_block,
+        user_draft_block=user_draft_block,
         cultural_context=cultural_context,
     )
 
@@ -798,7 +1044,20 @@ async def api_generate_persona(data: dict):
         result = _extract_json(text)
         if not isinstance(result, dict):
             raise ValueError("生成结果不是 JSON 对象")
-        return _normalize_persona_result(result, data)
+        normalized = _normalize_persona_result(result, data)
+        # 回传本次实际使用的 axes / 地区，避免前端存空或另抽一套
+        axes_keys = (axes or {}).get("keys") or {}
+        if axes_keys:
+            normalized["persona_axes"] = axes_keys
+            normalized["persona_axes_labels"] = (axes or {}).get("labels") or {}
+            normalized["persona_axes_summary"] = (axes or {}).get("summary") or ""
+        if data.get("country") or region_meta.get("country"):
+            normalized["country"] = data.get("country") or region_meta.get("country") or ""
+        if data.get("region_key") or region_meta.get("key"):
+            normalized["region_key"] = data.get("region_key") or region_meta.get("key") or ""
+        if data.get("region_label") or region_meta.get("label"):
+            normalized["region_label"] = data.get("region_label") or region_meta.get("label") or ""
+        return normalized
     except HTTPException:
         raise
     except Exception as e:
@@ -828,7 +1087,7 @@ async def api_create_companion(data: dict, x_token: Optional[str] = Header(None,
 
 @router.get("/companions")
 async def api_list_companions(x_token: Optional[str] = Header(None, alias="x-token")):
-    """获取当前用户的 companions 列表。必须登录，否则返回空列表。"""
+    """获取智能体列表（含他人创建的）；附带当前用户的亲密度/预览。必须登录。"""
     uid = verify_user_token(x_token) if x_token else None
     if not uid:
         return []
@@ -906,7 +1165,7 @@ async def api_generate_avatar(companion_id: str, user_id: int = Depends(require_
     companion = get_companion_manager().get(companion_id)
     if not companion:
         raise HTTPException(status_code=404, detail="智能体不存在")
-    _assert_companion_user_access(companion, user_id)
+    _assert_companion_owner(companion, user_id)
 
     get_companion_manager().update(companion_id, {"avatar_url": "__GENERATING__"})
     start_avatar_generation(companion_id, companion.profile.model_dump())
@@ -918,7 +1177,7 @@ async def api_delete_companion(companion_id: str, user_id: int = Depends(require
     companion = get_companion_manager().get(companion_id)
     if not companion:
         raise HTTPException(status_code=404, detail="智能体不存在")
-    _assert_companion_user_access(companion, user_id)
+    _assert_companion_owner(companion, user_id)
     ok = get_companion_manager().delete(companion_id)
     if not ok:
         raise HTTPException(status_code=404, detail="智能体不存在")
@@ -943,6 +1202,8 @@ async def api_clear_messages(companion_id: str, user_id: int = Depends(require_l
 @router.websocket("/ws/chat/{companion_id}")
 async def ws_chat(websocket: WebSocket, companion_id: str):
     await websocket.accept()
+    # 连接级发送锁：主循环 ping / receive pong / proactive / typing 共用
+    setattr(websocket, "_trandsai_send_lock", asyncio.Lock())
 
     ui_lang_early = normalize_ui_language(websocket.query_params.get("lang", "zh"))
 
@@ -952,7 +1213,7 @@ async def ws_chat(websocket: WebSocket, companion_id: str):
     if not user_id:
         try:
             err = _WS_AUTH_FAILED.get(ui_lang_early, _WS_AUTH_FAILED["zh"])
-            await websocket.send_text(json.dumps({"type": "error", "text": err}))
+            await _ws_send_json(websocket, {"type": "error", "text": err})
             await websocket.close(code=1008)
         except Exception:
             pass
@@ -961,7 +1222,7 @@ async def ws_chat(websocket: WebSocket, companion_id: str):
     companion = get_companion_manager().get(companion_id)
     if not companion:
         err = _WS_COMPANION_NOT_FOUND.get(ui_lang_early, _WS_COMPANION_NOT_FOUND["zh"])
-        await websocket.send_text(json.dumps({"type": "error", "text": err}))
+        await _ws_send_json(websocket, {"type": "error", "text": err})
         await websocket.close()
         return
 
@@ -975,22 +1236,24 @@ async def ws_chat(websocket: WebSocket, companion_id: str):
                 else None
             )
             err = detail or _WS_ACCESS_DENIED.get(ui_lang_early, _WS_ACCESS_DENIED["zh"])
-            await websocket.send_text(json.dumps({"type": "error", "text": err}))
+            await _ws_send_json(websocket, {"type": "error", "text": err})
             await websocket.close(code=1008)
         except Exception:
             pass
         return
 
     lang_param = normalize_ui_language(websocket.query_params.get("lang", "zh"))
-    session_meta = get_session(companion_id)
+    session_meta = get_session(companion_id, user_id=user_id)
     session_meta["lang"] = lang_param
     session_meta["user_id"] = user_id  # 记录用户ID用于后续会话
     session_meta.pop("pending_retention", None)
     session_meta.pop("last_disconnect", None)
-    await set_session(companion_id, session_meta)
+    await set_session(companion_id, session_meta, user_id=user_id)
     companion.memory.bind_user(user_id)  # REQ-A2
     user_lang = session_meta.get("lang") or "zh"
     connection_id = str(uuid.uuid4())
+    _ws_register(connection_id, websocket)
+    await _ensure_ws_janitor()
 
     # 消息去重：记录最近收到的消息内容和时间戳
     _recent_user_messages: list[dict] = []
@@ -1003,7 +1266,7 @@ async def ws_chat(websocket: WebSocket, companion_id: str):
     message_queue: asyncio.Queue = asyncio.Queue()
 
     async def _receive_loop():
-        """持续接收用户消息，存入队列"""
+        """持续接收用户消息，存入队列；应答/刷新应用层心跳。"""
         while True:
             try:
                 raw = await websocket.receive_text()
@@ -1011,8 +1274,19 @@ async def ws_chat(websocket: WebSocket, companion_id: str):
                     payload = json.loads(raw)
                 except Exception:
                     payload = {"text": raw}
+                msg_type = payload.get("type")
+                if msg_type == "ping":
+                    # 客户端心跳：回 pong，并记存活
+                    _ws_mark_alive(websocket)
+                    await _ws_send_json(websocket, {"type": "pong"})
+                    continue
+                if msg_type == "pong":
+                    # 应答服务端 ping：刷新存活，解除 awaiting
+                    _ws_mark_alive(websocket)
+                    continue
                 user_text = payload.get("text", "").strip()
                 if user_text:
+                    _ws_mark_alive(websocket)
                     await message_queue.put(payload)
             except WebSocketDisconnect:
                 await message_queue.put({"__disconnect": True})
@@ -1025,17 +1299,24 @@ async def ws_chat(websocket: WebSocket, companion_id: str):
 
     try:
         while True:
-            # 从队列等待用户消息
-            payload = await message_queue.get()
+            # 空闲等待用户消息；超时则发 ping，撑住代理读超时；无 pong 则清僵死连接
+            try:
+                payload = await asyncio.wait_for(
+                    message_queue.get(), timeout=_ws_heartbeat_interval()
+                )
+            except asyncio.TimeoutError:
+                if not await _ws_send_ping_or_close(websocket):
+                    break
+                continue
             if payload.get("__disconnect"):
                 if proactive_task and not proactive_task.done():
                     proactive_task.cancel()
-                prev_sess = get_session(companion_id)
+                prev_sess = get_session(companion_id, user_id=user_id)
                 prev_lang = prev_sess.get("lang")
-                next_sess = {**prev_sess, "lang": prev_lang or user_lang or "zh"}
+                next_sess = {**prev_sess, "lang": prev_lang or user_lang or "zh", "user_id": user_id}
                 next_sess.pop("pending_retention", None)
                 next_sess.pop("last_disconnect", None)
-                await set_session(companion_id, next_sess)
+                await set_session(companion_id, next_sess, user_id=user_id)
                 break
             first_text = payload.get("text", "").strip()
             if not first_text:
@@ -1063,10 +1344,7 @@ async def ws_chat(websocket: WebSocket, companion_id: str):
 
             if coalesce_skipped >= 2:
                 co_txt = _QUEUE_COALESCED_MESSAGE.get(lk_co, _QUEUE_COALESCED_MESSAGE["zh"])
-                try:
-                    await websocket.send_text(json.dumps({"type": "system", "text": co_txt}))
-                except Exception:
-                    pass
+                await _ws_send_json(websocket, {"type": "system", "text": co_txt})
 
             # 消息去重：极短句不拦（如连发「在吗」）；其余 5s 内全文相同视为连点/重复
             now = datetime.now(timezone.utc)
@@ -1080,10 +1358,7 @@ async def ws_chat(websocket: WebSocket, companion_id: str):
             if is_duplicate:
                 lk_dup = normalize_ui_language(burst_head.get("lang") or user_lang or "zh")
                 dup_txt = _DUPLICATE_USER_MESSAGE.get(lk_dup, _DUPLICATE_USER_MESSAGE["zh"])
-                try:
-                    await websocket.send_text(json.dumps({"type": "system", "text": dup_txt}))
-                except Exception:
-                    pass
+                await _ws_send_json(websocket, {"type": "system", "text": dup_txt})
                 continue
             _recent_user_messages.append({"text": combined_user_plain, "time": now})
             if len(_recent_user_messages) > 10:
@@ -1098,10 +1373,7 @@ async def ws_chat(websocket: WebSocket, companion_id: str):
 
             if not check_chat_rate_limit(user_id):
                 busy_txt = _AGENT_BUSY_MESSAGE.get(lk_co, _AGENT_BUSY_MESSAGE["zh"])
-                try:
-                    await websocket.send_text(json.dumps({"type": "error", "text": busy_txt}))
-                except Exception:
-                    pass
+                await _ws_send_json(websocket, {"type": "error", "text": busy_txt})
                 continue
 
             for line in burst_parts:
@@ -1115,11 +1387,7 @@ async def ws_chat(websocket: WebSocket, companion_id: str):
                 user_text_for_agent = prefix + numbered
             else:
                 user_text_for_agent = burst_parts[0]
-            try:
-                await websocket.send_text(json.dumps({"type": "typing"}))
-            except WebSocketDisconnect:
-                raise
-            except Exception:
+            if not await _ws_send_json(websocket, {"type": "typing"}):
                 continue
 
             memory_tier = os.getenv("AGENT_MEMORY_TIER", "full")
@@ -1156,7 +1424,7 @@ async def ws_chat(websocket: WebSocket, companion_id: str):
             # 忌用窗以近聊为准补齐（关系卡 deny 常被异步事实任务冲空）
             deny_hooks = seed_deny_from_recent(deny_hooks, recent_assistant)
             # C3 / M*：idle 与极端冷却时间戳（先算 idle，再刷新 last_user_ts）
-            session_meta_pre = get_session(companion_id) or {}
+            session_meta_pre = get_session(companion_id, user_id=user_id) or {}
             idle_seconds = None
             raw_prev_ts = session_meta_pre.get("last_user_ts")
             if raw_prev_ts:
@@ -1169,11 +1437,11 @@ async def ws_chat(websocket: WebSocket, companion_id: str):
                     idle_seconds = None
             last_extreme_ts = str(session_meta_pre.get("last_extreme_ts") or "")
             session_meta_pre["last_user_ts"] = datetime.now(timezone.utc).isoformat()
-            await set_session(companion_id, session_meta_pre)
+            await set_session(companion_id, session_meta_pre, user_id=user_id)
             language = normalize_ui_language(
-                burst_head.get("lang") or get_session(companion_id).get("lang") or user_lang or "zh"
+                burst_head.get("lang") or get_session(companion_id, user_id=user_id).get("lang") or user_lang or "zh"
             )
-            session_meta = get_session(companion_id)
+            session_meta = get_session(companion_id, user_id=user_id)
             session_meta["lang"] = language
             tz_pay = (burst_head.get("tz") or burst_head.get("timeZone") or "").strip()
             if tz_pay:
@@ -1183,7 +1451,7 @@ async def ws_chat(websocket: WebSocket, companion_id: str):
                     session_meta["client_tz_offset"] = int(burst_head["tz_offset"])
                 except (TypeError, ValueError):
                     pass
-            await set_session(companion_id, session_meta)
+            await set_session(companion_id, session_meta, user_id=user_id)
 
             tz_iana_effective = (
                 (burst_head.get("tz") or burst_head.get("timeZone") or "").strip()
@@ -1253,10 +1521,7 @@ async def ws_chat(websocket: WebSocket, companion_id: str):
                             payload = await wait_agent_result(connection_id, job.job_id)
                             if not payload or not payload.get("ok"):
                                 err_txt = _AGENT_TIMEOUT_MESSAGE.get(language, _AGENT_TIMEOUT_MESSAGE["zh"])
-                                try:
-                                    await websocket.send_text(json.dumps({"type": "error", "text": err_txt}))
-                                except Exception:
-                                    pass
+                                await _ws_send_json(websocket, {"type": "error", "text": err_txt})
                                 turn_error = "queue_failed"
                                 _log_chat_turn({
                                     "companion_id": companion_id,
@@ -1327,10 +1592,7 @@ async def ws_chat(websocket: WebSocket, companion_id: str):
                             acquired = True
                         except asyncio.TimeoutError:
                             busy_txt = _AGENT_BUSY_MESSAGE.get(language, _AGENT_BUSY_MESSAGE["zh"])
-                            try:
-                                await websocket.send_text(json.dumps({"type": "system", "text": busy_txt}))
-                            except Exception:
-                                pass
+                            await _ws_send_json(websocket, {"type": "system", "text": busy_txt})
                             _log_chat_turn({
                                 "companion_id": companion_id,
                                 "user_id": user_id,
@@ -1353,11 +1615,8 @@ async def ws_chat(websocket: WebSocket, companion_id: str):
                         result = await asyncio.wait_for(asyncio.shield(agent_task), timeout=120.0)
                     except asyncio.TimeoutError:
                         turn_error = "timeout"
-                        try:
-                            err_txt = _AGENT_TIMEOUT_MESSAGE.get(language, _AGENT_TIMEOUT_MESSAGE["zh"])
-                            await websocket.send_text(json.dumps({"type": "error", "text": err_txt}))
-                        except Exception:
-                            pass
+                        err_txt = _AGENT_TIMEOUT_MESSAGE.get(language, _AGENT_TIMEOUT_MESSAGE["zh"])
+                        await _ws_send_json(websocket, {"type": "error", "text": err_txt})
                         _log_chat_turn({
                             "companion_id": companion_id,
                             "user_id": user_id,
@@ -1634,9 +1893,9 @@ async def ws_chat(websocket: WebSocket, companion_id: str):
                         asyncio.create_task(_async_facts())
 
                 if result.get("means_mode") == "extreme":
-                    sess_x = get_session(companion_id) or {}
+                    sess_x = get_session(companion_id, user_id=user_id) or {}
                     sess_x["last_extreme_ts"] = datetime.now(timezone.utc).isoformat()
-                    await set_session(companion_id, sess_x)
+                    await set_session(companion_id, sess_x, user_id=user_id)
 
                 _log_chat_turn({
                     "companion_id": companion_id,
@@ -1656,25 +1915,25 @@ async def ws_chat(websocket: WebSocket, companion_id: str):
 
             # AI 回复完成后，启动新的主动消息定时任务
             proactive_task = asyncio.create_task(
-                _send_proactive_message(websocket, companion, language, companion_id)
+                _send_proactive_message(websocket, companion, language, companion_id, user_id=user_id)
             )
 
     except WebSocketDisconnect:
         if proactive_task and not proactive_task.done():
             proactive_task.cancel()
-        prev_sess = get_session(companion_id)
+        prev_sess = get_session(companion_id, user_id=user_id)
         prev_lang = prev_sess.get("lang")
-        next_sess = {**prev_sess, "lang": prev_lang or user_lang or "zh"}
+        next_sess = {**prev_sess, "lang": prev_lang or user_lang or "zh", "user_id": user_id}
         next_sess.pop("pending_retention", None)
         next_sess.pop("last_disconnect", None)
-        await set_session(companion_id, next_sess)
+        await set_session(companion_id, next_sess, user_id=user_id)
     except Exception:
         logger.exception("WebSocket chat loop failed for companion %s", companion_id)
         try:
             if websocket.client_state == WebSocketState.CONNECTED:
-                lk = normalize_ui_language(get_session(companion_id).get("lang") or "zh")
+                lk = normalize_ui_language(get_session(companion_id, user_id=user_id).get("lang") or "zh")
                 msg = _WS_CHAT_UNEXPECTED_ERROR.get(lk, _WS_CHAT_UNEXPECTED_ERROR["zh"])
-                await websocket.send_text(json.dumps({"type": "error", "text": msg}))
+                await _ws_send_json(websocket, {"type": "error", "text": msg})
         except Exception as send_err:
             logger.warning(
                 "Failed to send websocket error payload for companion %s: %s",
@@ -1682,6 +1941,7 @@ async def ws_chat(websocket: WebSocket, companion_id: str):
                 send_err,
             )
     finally:
+        _ws_unregister(connection_id)
         if proactive_task and not proactive_task.done():
             proactive_task.cancel()
             try:
@@ -1693,6 +1953,12 @@ async def ws_chat(websocket: WebSocket, companion_id: str):
         try:
             await receiver_task
         except asyncio.CancelledError:
+            pass
+        # 确保僵死/异常路径也释放底层连接
+        try:
+            if websocket.client_state == WebSocketState.CONNECTED:
+                await websocket.close()
+        except Exception:
             pass
 
 

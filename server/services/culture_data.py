@@ -1,6 +1,19 @@
 from __future__ import annotations
 # 地区文化数据 —— 姓名、城市、文化常识
 
+from services.personality_catalog import (
+    get_personality_labels_db,
+    join_personality_labels,
+    sample_personality_labels,
+)
+from services.persona_axes import sample_persona_axes
+from services.region_catalog import (
+    cities_db_from_regions,
+    find_region_for_city,
+    get_cities_for_region,
+    list_regions,
+)
+
 # ===== 姓名库（按语言和性别） =====
 NAMES_DB = {
     "zh": {
@@ -34,16 +47,8 @@ NAMES_DB = {
 }
 
 
-# ===== 城市库（按语言） =====
-CITIES_DB = {
-    "zh": ["北京", "上海", "成都", "广州", "深圳", "杭州", "武汉", "西安", "南京", "重庆"],
-    "en": ["New York", "Los Angeles", "London", "San Francisco", "Seattle", "Chicago", "Boston", "Austin", "Melbourne", "Toronto"],
-    "ja": ["東京", "大阪", "京都", "札幌", "福岡", "名古屋", "横浜", "神戸", "仙台", "広島"],
-    "ko": ["서울", "부산", "인천", "대구", "광주", "대전", "울산", "제주", "수원", "창원"],
-    "pt": ["São Paulo", "Rio de Janeiro", "Salvador", "Brasília", "Belo Horizonte", "Fortaleza", "Curitiba", "Porto Alegre", "Recife", "Manaus"],
-    "es": ["Madrid", "Barcelona", "México City", "Buenos Aires", "Lima", "Bogotá", "Santiago", "Valencia", "Sevilla", "Guadalajara"],
-    "id": ["Jakarta", "Surabaya", "Bandung", "Medan", "Makassar", "Yogyakarta", "Semarang", "Bali", "Palembang", "Malang"],
-}
+# ===== 城市库（按语言；权威来源 region_catalog，运行时派生，避免双份漂移） =====
+CITIES_DB = cities_db_from_regions()
 
 
 # ===== 文化常识知识库（按语言，用于 RAG 导入） =====
@@ -296,6 +301,138 @@ _CITY_LOCALE: dict[str, dict[str, str]] = {
     "Bali": {"lang": "id", "region": "Bali", "language": "Bahasa Indonesia", "ideology": "Spiritual-harmoni, terbuka pada wisatawan tapi jaga adat; hidup seimbang.", "everyday": "pura, pantai, hospitality."},
     "Palembang": {"lang": "id", "region": "Sumatra", "language": "Bahasa Indonesia", "ideology": "Hangat, bangga kuliner/sungai; kekeluargaan.", "everyday": "pempek, sungai Musi."},
     "Malang": {"lang": "id", "region": "Jawa Timur", "language": "Bahasa Indonesia", "ideology": "Santai-edukatif, komunitas muda; ramah tanpa lebay.", "everyday": "kampus, sejuk, wisata dekat."},
+    # auto-expanded city stubs
+    "天津": {"lang": "zh", "region": "中国都市", "language": "普通话", "ideology": "务实含蓄、家庭与个人奋斗并存；关系推进看行动与长期承诺。", "everyday": "天津的通勤与市井节奏、外卖与社交平台日常。",},
+    "苏州": {"lang": "zh", "region": "中国都市", "language": "普通话", "ideology": "务实含蓄、家庭与个人奋斗并存；关系推进看行动与长期承诺。", "everyday": "苏州的通勤与市井节奏、外卖与社交平台日常。",},
+    "长沙": {"lang": "zh", "region": "中国都市", "language": "普通话", "ideology": "务实含蓄、家庭与个人奋斗并存；关系推进看行动与长期承诺。", "everyday": "长沙的通勤与市井节奏、外卖与社交平台日常。",},
+    "郑州": {"lang": "zh", "region": "中国都市", "language": "普通话", "ideology": "务实含蓄、家庭与个人奋斗并存；关系推进看行动与长期承诺。", "everyday": "郑州的通勤与市井节奏、外卖与社交平台日常。",},
+    "青岛": {"lang": "zh", "region": "中国都市", "language": "普通话", "ideology": "务实含蓄、家庭与个人奋斗并存；关系推进看行动与长期承诺。", "everyday": "青岛的通勤与市井节奏、外卖与社交平台日常。",},
+    "大连": {"lang": "zh", "region": "中国都市", "language": "普通话", "ideology": "务实含蓄、家庭与个人奋斗并存；关系推进看行动与长期承诺。", "everyday": "大连的通勤与市井节奏、外卖与社交平台日常。",},
+    "厦门": {"lang": "zh", "region": "中国都市", "language": "普通话", "ideology": "务实含蓄、家庭与个人奋斗并存；关系推进看行动与长期承诺。", "everyday": "厦门的通勤与市井节奏、外卖与社交平台日常。",},
+    "福州": {"lang": "zh", "region": "中国都市", "language": "普通话", "ideology": "务实含蓄、家庭与个人奋斗并存；关系推进看行动与长期承诺。", "everyday": "福州的通勤与市井节奏、外卖与社交平台日常。",},
+    "合肥": {"lang": "zh", "region": "中国都市", "language": "普通话", "ideology": "务实含蓄、家庭与个人奋斗并存；关系推进看行动与长期承诺。", "everyday": "合肥的通勤与市井节奏、外卖与社交平台日常。",},
+    "昆明": {"lang": "zh", "region": "中国都市", "language": "普通话", "ideology": "务实含蓄、家庭与个人奋斗并存；关系推进看行动与长期承诺。", "everyday": "昆明的通勤与市井节奏、外卖与社交平台日常。",},
+    "贵阳": {"lang": "zh", "region": "中国都市", "language": "普通话", "ideology": "务实含蓄、家庭与个人奋斗并存；关系推进看行动与长期承诺。", "everyday": "贵阳的通勤与市井节奏、外卖与社交平台日常。",},
+    "南宁": {"lang": "zh", "region": "中国都市", "language": "普通话", "ideology": "务实含蓄、家庭与个人奋斗并存；关系推进看行动与长期承诺。", "everyday": "南宁的通勤与市井节奏、外卖与社交平台日常。",},
+    "南昌": {"lang": "zh", "region": "中国都市", "language": "普通话", "ideology": "务实含蓄、家庭与个人奋斗并存；关系推进看行动与长期承诺。", "everyday": "南昌的通勤与市井节奏、外卖与社交平台日常。",},
+    "哈尔滨": {"lang": "zh", "region": "中国都市", "language": "普通话", "ideology": "务实含蓄、家庭与个人奋斗并存；关系推进看行动与长期承诺。", "everyday": "哈尔滨的通勤与市井节奏、外卖与社交平台日常。",},
+    "长春": {"lang": "zh", "region": "中国都市", "language": "普通话", "ideology": "务实含蓄、家庭与个人奋斗并存；关系推进看行动与长期承诺。", "everyday": "长春的通勤与市井节奏、外卖与社交平台日常。",},
+    "沈阳": {"lang": "zh", "region": "中国都市", "language": "普通话", "ideology": "务实含蓄、家庭与个人奋斗并存；关系推进看行动与长期承诺。", "everyday": "沈阳的通勤与市井节奏、外卖与社交平台日常。",},
+    "石家庄": {"lang": "zh", "region": "中国都市", "language": "普通话", "ideology": "务实含蓄、家庭与个人奋斗并存；关系推进看行动与长期承诺。", "everyday": "石家庄的通勤与市井节奏、外卖与社交平台日常。",},
+    "太原": {"lang": "zh", "region": "中国都市", "language": "普通话", "ideology": "务实含蓄、家庭与个人奋斗并存；关系推进看行动与长期承诺。", "everyday": "太原的通勤与市井节奏、外卖与社交平台日常。",},
+    "兰州": {"lang": "zh", "region": "中国都市", "language": "普通话", "ideology": "务实含蓄、家庭与个人奋斗并存；关系推进看行动与长期承诺。", "everyday": "兰州的通勤与市井节奏、外卖与社交平台日常。",},
+    "银川": {"lang": "zh", "region": "中国都市", "language": "普通话", "ideology": "务实含蓄、家庭与个人奋斗并存；关系推进看行动与长期承诺。", "everyday": "银川的通勤与市井节奏、外卖与社交平台日常。",},
+    "乌鲁木齐": {"lang": "zh", "region": "中国都市", "language": "普通话", "ideology": "务实含蓄、家庭与个人奋斗并存；关系推进看行动与长期承诺。", "everyday": "乌鲁木齐的通勤与市井节奏、外卖与社交平台日常。",},
+    "海口": {"lang": "zh", "region": "中国都市", "language": "普通话", "ideology": "务实含蓄、家庭与个人奋斗并存；关系推进看行动与长期承诺。", "everyday": "海口的通勤与市井节奏、外卖与社交平台日常。",},
+    "三亚": {"lang": "zh", "region": "中国都市", "language": "普通话", "ideology": "务实含蓄、家庭与个人奋斗并存；关系推进看行动与长期承诺。", "everyday": "三亚的通勤与市井节奏、外卖与社交平台日常。",},
+    "香港": {"lang": "zh", "region": "中国都市", "language": "普通话", "ideology": "务实含蓄、家庭与个人奋斗并存；关系推进看行动与长期承诺。", "everyday": "香港的通勤与市井节奏、外卖与社交平台日常。",},
+    "台北": {"lang": "zh", "region": "中国都市", "language": "普通话", "ideology": "务实含蓄、家庭与个人奋斗并存；关系推进看行动与长期承诺。", "everyday": "台北的通勤与市井节奏、外卖与社交平台日常。",},
+    "Vancouver": {"lang": "en", "region": "English-speaking urban", "language": "English", "ideology": "Directness, personal space, negotiated intimacy; honesty over performance.", "everyday": "Local transit and neighborhood life in Vancouver; coffee, weekends, work hustle.",},
+    "Sydney": {"lang": "en", "region": "English-speaking urban", "language": "English", "ideology": "Directness, personal space, negotiated intimacy; honesty over performance.", "everyday": "Local transit and neighborhood life in Sydney; coffee, weekends, work hustle.",},
+    "Manchester": {"lang": "en", "region": "English-speaking urban", "language": "English", "ideology": "Directness, personal space, negotiated intimacy; honesty over performance.", "everyday": "Local transit and neighborhood life in Manchester; coffee, weekends, work hustle.",},
+    "Dublin": {"lang": "en", "region": "English-speaking urban", "language": "English", "ideology": "Directness, personal space, negotiated intimacy; honesty over performance.", "everyday": "Local transit and neighborhood life in Dublin; coffee, weekends, work hustle.",},
+    "Edinburgh": {"lang": "en", "region": "English-speaking urban", "language": "English", "ideology": "Directness, personal space, negotiated intimacy; honesty over performance.", "everyday": "Local transit and neighborhood life in Edinburgh; coffee, weekends, work hustle.",},
+    "Portland": {"lang": "en", "region": "English-speaking urban", "language": "English", "ideology": "Directness, personal space, negotiated intimacy; honesty over performance.", "everyday": "Local transit and neighborhood life in Portland; coffee, weekends, work hustle.",},
+    "Denver": {"lang": "en", "region": "English-speaking urban", "language": "English", "ideology": "Directness, personal space, negotiated intimacy; honesty over performance.", "everyday": "Local transit and neighborhood life in Denver; coffee, weekends, work hustle.",},
+    "Miami": {"lang": "en", "region": "English-speaking urban", "language": "English", "ideology": "Directness, personal space, negotiated intimacy; honesty over performance.", "everyday": "Local transit and neighborhood life in Miami; coffee, weekends, work hustle.",},
+    "Atlanta": {"lang": "en", "region": "English-speaking urban", "language": "English", "ideology": "Directness, personal space, negotiated intimacy; honesty over performance.", "everyday": "Local transit and neighborhood life in Atlanta; coffee, weekends, work hustle.",},
+    "Philadelphia": {"lang": "en", "region": "English-speaking urban", "language": "English", "ideology": "Directness, personal space, negotiated intimacy; honesty over performance.", "everyday": "Local transit and neighborhood life in Philadelphia; coffee, weekends, work hustle.",},
+    "Minneapolis": {"lang": "en", "region": "English-speaking urban", "language": "English", "ideology": "Directness, personal space, negotiated intimacy; honesty over performance.", "everyday": "Local transit and neighborhood life in Minneapolis; coffee, weekends, work hustle.",},
+    "San Diego": {"lang": "en", "region": "English-speaking urban", "language": "English", "ideology": "Directness, personal space, negotiated intimacy; honesty over performance.", "everyday": "Local transit and neighborhood life in San Diego; coffee, weekends, work hustle.",},
+    "Houston": {"lang": "en", "region": "English-speaking urban", "language": "English", "ideology": "Directness, personal space, negotiated intimacy; honesty over performance.", "everyday": "Local transit and neighborhood life in Houston; coffee, weekends, work hustle.",},
+    "Dallas": {"lang": "en", "region": "English-speaking urban", "language": "English", "ideology": "Directness, personal space, negotiated intimacy; honesty over performance.", "everyday": "Local transit and neighborhood life in Dallas; coffee, weekends, work hustle.",},
+    "Singapore": {"lang": "en", "region": "English-speaking urban", "language": "English", "ideology": "Directness, personal space, negotiated intimacy; honesty over performance.", "everyday": "Local transit and neighborhood life in Singapore; coffee, weekends, work hustle.",},
+    "Auckland": {"lang": "en", "region": "English-speaking urban", "language": "English", "ideology": "Directness, personal space, negotiated intimacy; honesty over performance.", "everyday": "Local transit and neighborhood life in Auckland; coffee, weekends, work hustle.",},
+    "Cape Town": {"lang": "en", "region": "English-speaking urban", "language": "English", "ideology": "Directness, personal space, negotiated intimacy; honesty over performance.", "everyday": "Local transit and neighborhood life in Cape Town; coffee, weekends, work hustle.",},
+    "千葉": {"lang": "ja", "region": "日本都市", "language": "日本語", "ideology": "遠慮・察し・段階的な関係；礼儀と本音の距離感。", "everyday": "千葉の電車・コンビニ・地元の食と季節感。",},
+    "埼玉": {"lang": "ja", "region": "日本都市", "language": "日本語", "ideology": "遠慮・察し・段階的な関係；礼儀と本音の距離感。", "everyday": "埼玉の電車・コンビニ・地元の食と季節感。",},
+    "静岡": {"lang": "ja", "region": "日本都市", "language": "日本語", "ideology": "遠慮・察し・段階的な関係；礼儀と本音の距離感。", "everyday": "静岡の電車・コンビニ・地元の食と季節感。",},
+    "金沢": {"lang": "ja", "region": "日本都市", "language": "日本語", "ideology": "遠慮・察し・段階的な関係；礼儀と本音の距離感。", "everyday": "金沢の電車・コンビニ・地元の食と季節感。",},
+    "新潟": {"lang": "ja", "region": "日本都市", "language": "日本語", "ideology": "遠慮・察し・段階的な関係；礼儀と本音の距離感。", "everyday": "新潟の電車・コンビニ・地元の食と季節感。",},
+    "岡山": {"lang": "ja", "region": "日本都市", "language": "日本語", "ideology": "遠慮・察し・段階的な関係；礼儀と本音の距離感。", "everyday": "岡山の電車・コンビニ・地元の食と季節感。",},
+    "熊本": {"lang": "ja", "region": "日本都市", "language": "日本語", "ideology": "遠慮・察し・段階的な関係；礼儀と本音の距離感。", "everyday": "熊本の電車・コンビニ・地元の食と季節感。",},
+    "鹿児島": {"lang": "ja", "region": "日本都市", "language": "日本語", "ideology": "遠慮・察し・段階的な関係；礼儀と本音の距離感。", "everyday": "鹿児島の電車・コンビニ・地元の食と季節感。",},
+    "那覇": {"lang": "ja", "region": "日本都市", "language": "日本語", "ideology": "遠慮・察し・段階的な関係；礼儀と本音の距離感。", "everyday": "那覇の電車・コンビニ・地元の食と季節感。",},
+    "松山": {"lang": "ja", "region": "日本都市", "language": "日本語", "ideology": "遠慮・察し・段階的な関係；礼儀と本音の距離感。", "everyday": "松山の電車・コンビニ・地元の食と季節感。",},
+    "高松": {"lang": "ja", "region": "日本都市", "language": "日本語", "ideology": "遠慮・察し・段階的な関係；礼儀と本音の距離感。", "everyday": "高松の電車・コンビニ・地元の食と季節感。",},
+    "富山": {"lang": "ja", "region": "日本都市", "language": "日本語", "ideology": "遠慮・察し・段階的な関係；礼儀と本音の距離感。", "everyday": "富山の電車・コンビニ・地元の食と季節感。",},
+    "長野": {"lang": "ja", "region": "日本都市", "language": "日本語", "ideology": "遠慮・察し・段階的な関係；礼儀と本音の距離感。", "everyday": "長野の電車・コンビニ・地元の食と季節感。",},
+    "宇都宮": {"lang": "ja", "region": "日本都市", "language": "日本語", "ideology": "遠慮・察し・段階的な関係；礼儀と本音の距離感。", "everyday": "宇都宮の電車・コンビニ・地元の食と季節感。",},
+    "岐阜": {"lang": "ja", "region": "日本都市", "language": "日本語", "ideology": "遠慮・察し・段階的な関係；礼儀と本音の距離感。", "everyday": "岐阜の電車・コンビニ・地元の食と季節感。",},
+    "奈良": {"lang": "ja", "region": "日本都市", "language": "日本語", "ideology": "遠慮・察し・段階的な関係；礼儀と本音の距離感。", "everyday": "奈良の電車・コンビニ・地元の食と季節感。",},
+    "和歌山": {"lang": "ja", "region": "日本都市", "language": "日本語", "ideology": "遠慮・察し・段階的な関係；礼儀と本音の距離感。", "everyday": "和歌山の電車・コンビニ・地元の食と季節感。",},
+    "青森": {"lang": "ja", "region": "日本都市", "language": "日本語", "ideology": "遠慮・察し・段階的な関係；礼儀と本音の距離感。", "everyday": "青森の電車・コンビニ・地元の食と季節感。",},
+    "성남": {"lang": "ko", "region": "한국 도시", "language": "한국어", "ideology": "속도·체면과 애정표현 공존；관계 단계와 응답에 민감.", "everyday": "성남의 카페·배달·출퇴근 리듬.",},
+    "고양": {"lang": "ko", "region": "한국 도시", "language": "한국어", "ideology": "속도·체면과 애정표현 공존；관계 단계와 응답에 민감.", "everyday": "고양의 카페·배달·출퇴근 리듬.",},
+    "용인": {"lang": "ko", "region": "한국 도시", "language": "한국어", "ideology": "속도·체면과 애정표현 공존；관계 단계와 응답에 민감.", "everyday": "용인의 카페·배달·출퇴근 리듬.",},
+    "청주": {"lang": "ko", "region": "한국 도시", "language": "한국어", "ideology": "속도·체면과 애정표현 공존；관계 단계와 응답에 민감.", "everyday": "청주의 카페·배달·출퇴근 리듬.",},
+    "전주": {"lang": "ko", "region": "한국 도시", "language": "한국어", "ideology": "속도·체면과 애정표현 공존；관계 단계와 응답에 민감.", "everyday": "전주의 카페·배달·출퇴근 리듬.",},
+    "천안": {"lang": "ko", "region": "한국 도시", "language": "한국어", "ideology": "속도·체면과 애정표현 공존；관계 단계와 응답에 민감.", "everyday": "천안의 카페·배달·출퇴근 리듬.",},
+    "포항": {"lang": "ko", "region": "한국 도시", "language": "한국어", "ideology": "속도·체면과 애정표현 공존；관계 단계와 응답에 민감.", "everyday": "포항의 카페·배달·출퇴근 리듬.",},
+    "안산": {"lang": "ko", "region": "한국 도시", "language": "한국어", "ideology": "속도·체면과 애정표현 공존；관계 단계와 응답에 민감.", "everyday": "안산의 카페·배달·출퇴근 리듬.",},
+    "부천": {"lang": "ko", "region": "한국 도시", "language": "한국어", "ideology": "속도·체면과 애정표현 공존；관계 단계와 응답에 민감.", "everyday": "부천의 카페·배달·출퇴근 리듬.",},
+    "남양주": {"lang": "ko", "region": "한국 도시", "language": "한국어", "ideology": "속도·체면과 애정표현 공존；관계 단계와 응답에 민감.", "everyday": "남양주의 카페·배달·출퇴근 리듬.",},
+    "화성": {"lang": "ko", "region": "한국 도시", "language": "한국어", "ideology": "속도·체면과 애정표현 공존；관계 단계와 응답에 민감.", "everyday": "화성의 카페·배달·출퇴근 리듬.",},
+    "평택": {"lang": "ko", "region": "한국 도시", "language": "한국어", "ideology": "속도·체면과 애정표현 공존；관계 단계와 응답에 민감.", "everyday": "평택의 카페·배달·출퇴근 리듬.",},
+    "김해": {"lang": "ko", "region": "한국 도시", "language": "한국어", "ideology": "속도·체면과 애정표현 공존；관계 단계와 응답에 민감.", "everyday": "김해의 카페·배달·출퇴근 리듬.",},
+    "진주": {"lang": "ko", "region": "한국 도시", "language": "한국어", "ideology": "속도·체면과 애정표현 공존；관계 단계와 응답에 민감.", "everyday": "진주의 카페·배달·출퇴근 리듬.",},
+    "원주": {"lang": "ko", "region": "한국 도시", "language": "한국어", "ideology": "속도·체면과 애정표현 공존；관계 단계와 응답에 민감.", "everyday": "원주의 카페·배달·출퇴근 리듬.",},
+    "춘천": {"lang": "ko", "region": "한국 도시", "language": "한국어", "ideology": "속도·체면과 애정표현 공존；관계 단계와 응답에 민감.", "everyday": "춘천의 카페·배달·출퇴근 리듬.",},
+    "강릉": {"lang": "ko", "region": "한국 도시", "language": "한국어", "ideology": "속도·체면과 애정표현 공존；관계 단계와 응답에 민감.", "everyday": "강릉의 카페·배달·출퇴근 리듬.",},
+    "여수": {"lang": "ko", "region": "한국 도시", "language": "한국어", "ideology": "속도·체면과 애정표현 공존；관계 단계와 응답에 민감.", "everyday": "여수의 카페·배달·출퇴근 리듬.",},
+    "순천": {"lang": "ko", "region": "한국 도시", "language": "한국어", "ideology": "속도·체면과 애정표현 공존；관계 단계와 응답에 민감.", "everyday": "순천의 카페·배달·출퇴근 리듬.",},
+    "Belém": {"lang": "pt", "region": "mundo lusófono urbano", "language": "português", "ideology": "Calor afetivo, presença e família; celebração e lealdade.", "everyday": "Ritmo urbano de Belém: comida, encontros, WhatsApp.",},
+    "Goiânia": {"lang": "pt", "region": "mundo lusófono urbano", "language": "português", "ideology": "Calor afetivo, presença e família; celebração e lealdade.", "everyday": "Ritmo urbano de Goiânia: comida, encontros, WhatsApp.",},
+    "Campinas": {"lang": "pt", "region": "mundo lusófono urbano", "language": "português", "ideology": "Calor afetivo, presença e família; celebração e lealdade.", "everyday": "Ritmo urbano de Campinas: comida, encontros, WhatsApp.",},
+    "São Luís": {"lang": "pt", "region": "mundo lusófono urbano", "language": "português", "ideology": "Calor afetivo, presença e família; celebração e lealdade.", "everyday": "Ritmo urbano de São Luís: comida, encontros, WhatsApp.",},
+    "Maceió": {"lang": "pt", "region": "mundo lusófono urbano", "language": "português", "ideology": "Calor afetivo, presença e família; celebração e lealdade.", "everyday": "Ritmo urbano de Maceió: comida, encontros, WhatsApp.",},
+    "Natal": {"lang": "pt", "region": "mundo lusófono urbano", "language": "português", "ideology": "Calor afetivo, presença e família; celebração e lealdade.", "everyday": "Ritmo urbano de Natal: comida, encontros, WhatsApp.",},
+    "Teresina": {"lang": "pt", "region": "mundo lusófono urbano", "language": "português", "ideology": "Calor afetivo, presença e família; celebração e lealdade.", "everyday": "Ritmo urbano de Teresina: comida, encontros, WhatsApp.",},
+    "João Pessoa": {"lang": "pt", "region": "mundo lusófono urbano", "language": "português", "ideology": "Calor afetivo, presença e família; celebração e lealdade.", "everyday": "Ritmo urbano de João Pessoa: comida, encontros, WhatsApp.",},
+    "Florianópolis": {"lang": "pt", "region": "mundo lusófono urbano", "language": "português", "ideology": "Calor afetivo, presença e família; celebração e lealdade.", "everyday": "Ritmo urbano de Florianópolis: comida, encontros, WhatsApp.",},
+    "Vitória": {"lang": "pt", "region": "mundo lusófono urbano", "language": "português", "ideology": "Calor afetivo, presença e família; celebração e lealdade.", "everyday": "Ritmo urbano de Vitória: comida, encontros, WhatsApp.",},
+    "Santos": {"lang": "pt", "region": "mundo lusófono urbano", "language": "português", "ideology": "Calor afetivo, presença e família; celebração e lealdade.", "everyday": "Ritmo urbano de Santos: comida, encontros, WhatsApp.",},
+    "Ribeirão Preto": {"lang": "pt", "region": "mundo lusófono urbano", "language": "português", "ideology": "Calor afetivo, presença e família; celebração e lealdade.", "everyday": "Ritmo urbano de Ribeirão Preto: comida, encontros, WhatsApp.",},
+    "Uberlândia": {"lang": "pt", "region": "mundo lusófono urbano", "language": "português", "ideology": "Calor afetivo, presença e família; celebração e lealdade.", "everyday": "Ritmo urbano de Uberlândia: comida, encontros, WhatsApp.",},
+    "Lisboa": {"lang": "pt", "region": "mundo lusófono urbano", "language": "português", "ideology": "Calor afetivo, presença e família; celebração e lealdade.", "everyday": "Ritmo urbano de Lisboa: comida, encontros, WhatsApp.",},
+    "Porto": {"lang": "pt", "region": "mundo lusófono urbano", "language": "português", "ideology": "Calor afetivo, presença e família; celebração e lealdade.", "everyday": "Ritmo urbano de Porto: comida, encontros, WhatsApp.",},
+    "Coimbra": {"lang": "pt", "region": "mundo lusófono urbano", "language": "português", "ideology": "Calor afetivo, presença e família; celebração e lealdade.", "everyday": "Ritmo urbano de Coimbra: comida, encontros, WhatsApp.",},
+    "Monterrey": {"lang": "es", "region": "mundo hispano urbano", "language": "español", "ideology": "Expresividad, familia y sobremesa; pasión con humor local.", "everyday": "Vida cotidiana en Monterrey: café, comida, calles y familia.",},
+    "Medellín": {"lang": "es", "region": "mundo hispano urbano", "language": "español", "ideology": "Expresividad, familia y sobremesa; pasión con humor local.", "everyday": "Vida cotidiana en Medellín: café, comida, calles y familia.",},
+    "Quito": {"lang": "es", "region": "mundo hispano urbano", "language": "español", "ideology": "Expresividad, familia y sobremesa; pasión con humor local.", "everyday": "Vida cotidiana en Quito: café, comida, calles y familia.",},
+    "Caracas": {"lang": "es", "region": "mundo hispano urbano", "language": "español", "ideology": "Expresividad, familia y sobremesa; pasión con humor local.", "everyday": "Vida cotidiana en Caracas: café, comida, calles y familia.",},
+    "Montevideo": {"lang": "es", "region": "mundo hispano urbano", "language": "español", "ideology": "Expresividad, familia y sobremesa; pasión con humor local.", "everyday": "Vida cotidiana en Montevideo: café, comida, calles y familia.",},
+    "Asunción": {"lang": "es", "region": "mundo hispano urbano", "language": "español", "ideology": "Expresividad, familia y sobremesa; pasión con humor local.", "everyday": "Vida cotidiana en Asunción: café, comida, calles y familia.",},
+    "La Paz": {"lang": "es", "region": "mundo hispano urbano", "language": "español", "ideology": "Expresividad, familia y sobremesa; pasión con humor local.", "everyday": "Vida cotidiana en La Paz: café, comida, calles y familia.",},
+    "Córdoba": {"lang": "es", "region": "mundo hispano urbano", "language": "español", "ideology": "Expresividad, familia y sobremesa; pasión con humor local.", "everyday": "Vida cotidiana en Córdoba: café, comida, calles y familia.",},
+    "Rosario": {"lang": "es", "region": "mundo hispano urbano", "language": "español", "ideology": "Expresividad, familia y sobremesa; pasión con humor local.", "everyday": "Vida cotidiana en Rosario: café, comida, calles y familia.",},
+    "Málaga": {"lang": "es", "region": "mundo hispano urbano", "language": "español", "ideology": "Expresividad, familia y sobremesa; pasión con humor local.", "everyday": "Vida cotidiana en Málaga: café, comida, calles y familia.",},
+    "Bilbao": {"lang": "es", "region": "mundo hispano urbano", "language": "español", "ideology": "Expresividad, familia y sobremesa; pasión con humor local.", "everyday": "Vida cotidiana en Bilbao: café, comida, calles y familia.",},
+    "Zaragoza": {"lang": "es", "region": "mundo hispano urbano", "language": "español", "ideology": "Expresividad, familia y sobremesa; pasión con humor local.", "everyday": "Vida cotidiana en Zaragoza: café, comida, calles y familia.",},
+    "Murcia": {"lang": "es", "region": "mundo hispano urbano", "language": "español", "ideology": "Expresividad, familia y sobremesa; pasión con humor local.", "everyday": "Vida cotidiana en Murcia: café, comida, calles y familia.",},
+    "Palma": {"lang": "es", "region": "mundo hispano urbano", "language": "español", "ideology": "Expresividad, familia y sobremesa; pasión con humor local.", "everyday": "Vida cotidiana en Palma: café, comida, calles y familia.",},
+    "Granada": {"lang": "es", "region": "mundo hispano urbano", "language": "español", "ideology": "Expresividad, familia y sobremesa; pasión con humor local.", "everyday": "Vida cotidiana en Granada: café, comida, calles y familia.",},
+    "Puebla": {"lang": "es", "region": "mundo hispano urbano", "language": "español", "ideology": "Expresividad, familia y sobremesa; pasión con humor local.", "everyday": "Vida cotidiana en Puebla: café, comida, calles y familia.",},
+    "Tijuana": {"lang": "es", "region": "mundo hispano urbano", "language": "español", "ideology": "Expresividad, familia y sobremesa; pasión con humor local.", "everyday": "Vida cotidiana en Tijuana: café, comida, calles y familia.",},
+    "Cancún": {"lang": "es", "region": "mundo hispano urbano", "language": "español", "ideology": "Expresividad, familia y sobremesa; pasión con humor local.", "everyday": "Vida cotidiana en Cancún: café, comida, calles y familia.",},
+    "Balikpapan": {"lang": "id", "region": "Indonesia urban", "language": "Bahasa Indonesia", "ideology": "Sopan, hormat, gotong royong; ungkapan sering tidak langsung.", "everyday": "Ritme Balikpapan: ojol, kuliner, WhatsApp, keluarga.",},
+    "Pontianak": {"lang": "id", "region": "Indonesia urban", "language": "Bahasa Indonesia", "ideology": "Sopan, hormat, gotong royong; ungkapan sering tidak langsung.", "everyday": "Ritme Pontianak: ojol, kuliner, WhatsApp, keluarga.",},
+    "Manado": {"lang": "id", "region": "Indonesia urban", "language": "Bahasa Indonesia", "ideology": "Sopan, hormat, gotong royong; ungkapan sering tidak langsung.", "everyday": "Ritme Manado: ojol, kuliner, WhatsApp, keluarga.",},
+    "Padang": {"lang": "id", "region": "Indonesia urban", "language": "Bahasa Indonesia", "ideology": "Sopan, hormat, gotong royong; ungkapan sering tidak langsung.", "everyday": "Ritme Padang: ojol, kuliner, WhatsApp, keluarga.",},
+    "Pekanbaru": {"lang": "id", "region": "Indonesia urban", "language": "Bahasa Indonesia", "ideology": "Sopan, hormat, gotong royong; ungkapan sering tidak langsung.", "everyday": "Ritme Pekanbaru: ojol, kuliner, WhatsApp, keluarga.",},
+    "Bandar Lampung": {"lang": "id", "region": "Indonesia urban", "language": "Bahasa Indonesia", "ideology": "Sopan, hormat, gotong royong; ungkapan sering tidak langsung.", "everyday": "Ritme Bandar Lampung: ojol, kuliner, WhatsApp, keluarga.",},
+    "Denpasar": {"lang": "id", "region": "Indonesia urban", "language": "Bahasa Indonesia", "ideology": "Sopan, hormat, gotong royong; ungkapan sering tidak langsung.", "everyday": "Ritme Denpasar: ojol, kuliner, WhatsApp, keluarga.",},
+    "Bogor": {"lang": "id", "region": "Indonesia urban", "language": "Bahasa Indonesia", "ideology": "Sopan, hormat, gotong royong; ungkapan sering tidak langsung.", "everyday": "Ritme Bogor: ojol, kuliner, WhatsApp, keluarga.",},
+    "Depok": {"lang": "id", "region": "Indonesia urban", "language": "Bahasa Indonesia", "ideology": "Sopan, hormat, gotong royong; ungkapan sering tidak langsung.", "everyday": "Ritme Depok: ojol, kuliner, WhatsApp, keluarga.",},
+    "Tangerang": {"lang": "id", "region": "Indonesia urban", "language": "Bahasa Indonesia", "ideology": "Sopan, hormat, gotong royong; ungkapan sering tidak langsung.", "everyday": "Ritme Tangerang: ojol, kuliner, WhatsApp, keluarga.",},
+    "Bekasi": {"lang": "id", "region": "Indonesia urban", "language": "Bahasa Indonesia", "ideology": "Sopan, hormat, gotong royong; ungkapan sering tidak langsung.", "everyday": "Ritme Bekasi: ojol, kuliner, WhatsApp, keluarga.",},
+    "Solo": {"lang": "id", "region": "Indonesia urban", "language": "Bahasa Indonesia", "ideology": "Sopan, hormat, gotong royong; ungkapan sering tidak langsung.", "everyday": "Ritme Solo: ojol, kuliner, WhatsApp, keluarga.",},
+    "Cirebon": {"lang": "id", "region": "Indonesia urban", "language": "Bahasa Indonesia", "ideology": "Sopan, hormat, gotong royong; ungkapan sering tidak langsung.", "everyday": "Ritme Cirebon: ojol, kuliner, WhatsApp, keluarga.",},
+    "Jambi": {"lang": "id", "region": "Indonesia urban", "language": "Bahasa Indonesia", "ideology": "Sopan, hormat, gotong royong; ungkapan sering tidak langsung.", "everyday": "Ritme Jambi: ojol, kuliner, WhatsApp, keluarga.",},
+    "Ambon": {"lang": "id", "region": "Indonesia urban", "language": "Bahasa Indonesia", "ideology": "Sopan, hormat, gotong royong; ungkapan sering tidak langsung.", "everyday": "Ritme Ambon: ojol, kuliner, WhatsApp, keluarga.",},
+    "Kupang": {"lang": "id", "region": "Indonesia urban", "language": "Bahasa Indonesia", "ideology": "Sopan, hormat, gotong royong; ungkapan sering tidak langsung.", "everyday": "Ritme Kupang: ojol, kuliner, WhatsApp, keluarga.",},
+    "Mataram": {"lang": "id", "region": "Indonesia urban", "language": "Bahasa Indonesia", "ideology": "Sopan, hormat, gotong royong; ungkapan sering tidak langsung.", "everyday": "Ritme Mataram: ojol, kuliner, WhatsApp, keluarga.",},
+    "Banjarmasin": {"lang": "id", "region": "Indonesia urban", "language": "Bahasa Indonesia", "ideology": "Sopan, hormat, gotong royong; ungkapan sering tidak langsung.", "everyday": "Ritme Banjarmasin: ojol, kuliner, WhatsApp, keluarga.",},
 }
 
 _LANG_MAINSTREAM: dict[str, dict[str, str]] = {
@@ -313,20 +450,115 @@ def _normalize_city_key(city: str) -> str:
     return (city or "").strip()
 
 
+_GENERIC_EVERYDAY_MARKERS = (
+    "通勤与市井节奏",
+    "Local transit and neighborhood life",
+    "카페·배달·출퇴근 리듬",
+    "電車・コンビニ・地元の食",
+    "ojol, kuliner, WhatsApp",
+    "comida, encuentros, WhatsApp",
+    "comida, encontros, WhatsApp",
+)
+
+_CITY_FLAVOR_BY_LANG = {
+    "zh": [
+        "本地夜市与早高峰地铁；周末常去城市公园或商场。",
+        "写字楼外卖文化浓；熟人局爱约火锅或烧烤。",
+        "老城区街巷与新区高楼对照；方言口音偶尔冒出来。",
+        "跨城通勤或同城公交地铁切换；节假日回老家压力大。",
+        "海边/江边散步是常见放松；短视频与本地生活号很活跃。",
+    ],
+    "en": [
+        "Neighborhood coffee shops, weekend markets, and transit delays shape the week.",
+        "Gym-after-work culture; friends meet for brunch or a walkable bar street.",
+        "Mix of downtown glass towers and quieter residential blocks.",
+        "Weather swings change plans; remote/hybrid work is common.",
+        "Local sports talk and community events fill Saturday mornings.",
+    ],
+    "ja": [
+        "沿線の駅前スーパーと居酒屋が生活圏；季節の行事が会話に出る。",
+        "終電を意識した飲み会；コンビニ夜食が日常。",
+        "観光地と生活圏が混ざる街なら、休日は混雑を避けがち。",
+        "社縁と地元友人が分かれ、LINEの返信テンポが関係温度を示す。",
+        "雨の日の傘文化と満員電車がストレス源になりやすい。",
+    ],
+    "ko": [
+        "동네 카페와 배달앱이 루틴；주말엔 한강/공원 산책이 흔하다.",
+        "출근 지옥철과 야근 뒤 치맥；기념일 챙김이 관계 신호다.",
+        "신도시 아파트 단지와 구도심 골목이 공존한다.",
+        "카톡 읽씹 민감도가 높고, 로컬 맛집 탐방이 데이트 단골이다.",
+        "환절기 미세먼지·날씨가 외출 계획을 좌우한다.",
+    ],
+    "pt": [
+        "Trânsito, boteco do bairro e áudios longos no WhatsApp marcam o ritmo.",
+        "Fim de semana de churrasco ou praia quando dá；família aparece sem aviso.",
+        "Mistura de centro comercial e rua de comércio popular.",
+        "Calor e chuva mudam o humor；futebol entra em qualquer papo.",
+        "App de comida e transporte por app são padrão no dia a dia.",
+    ],
+    "es": [
+        "Tapas de barrio, sobremesa larga y WhatsApp constante.",
+        "El metro o el bus definen la hora de llegar；la familia manda en el fin de semana.",
+        "Centro histórico y zonas nuevas conviven en la misma rutina.",
+        "El clima y las fiestas locales cambian el plan de salida.",
+        "Café de la mañana y cena tarde son anclas del día.",
+    ],
+    "id": [
+        "Macet dan ojol jadi ritme harian；ngopi di angkringan tetap favorit.",
+        "Mall dan warung kampung hidup berdampingan；keluarga sering mampir.",
+        "Cuaca panas/hujan mengubah rencana；WhatsApp grup RT aktif.",
+        "Kuliner kaki lima jadi cara nongkrong paling murah.",
+        "Lebaran dan libur panjang mengubah tempo kerja dan pacaran.",
+    ],
+}
+
+
+def _is_generic_locale(meta: dict) -> bool:
+    everyday = str(meta.get("everyday") or "")
+    return any(m in everyday for m in _GENERIC_EVERYDAY_MARKERS)
+
+
+def _enrich_city_locale(city: str, meta: dict) -> dict:
+    """为通用 stub 注入城市差异化 everyday，并挂上国家/地区标签。"""
+    out = dict(meta)
+    lk = (out.get("lang") or infer_language_from_city(city) or "zh").split("-")[0]
+    region = find_region_for_city(city, lk) or find_region_for_city(city)
+    if region:
+        out["country"] = region.get("country") or out.get("country") or ""
+        label = region.get("label") or ""
+        if label and label not in str(out.get("region") or ""):
+            out["region"] = f"{out.get('region') or ''} · {label}".strip(" ·")
+    if city and (_is_generic_locale(out) or not out.get("everyday")):
+        flavors = _CITY_FLAVOR_BY_LANG.get(lk) or _CITY_FLAVOR_BY_LANG["en"]
+        idx = sum(ord(ch) for ch in city) % len(flavors)
+        flavor = flavors[idx]
+        out["everyday"] = f"{city}: {flavor}"
+        # 轻微改写 ideology 尾句，避免整语种完全同文
+        ide = str(out.get("ideology") or "").rstrip("。．. ")
+        out["ideology"] = f"{ide}；日常锚点落在{city}本城语境。" if lk == "zh" else f"{ide} Local life is anchored in {city}."
+    return out
+
+
 def resolve_locale(city: str, lang: str | None = None) -> dict[str, str]:
-    """解析城市对应的主流文化锚点；城市优先，其次语言级默认。"""
+    """解析城市对应的主流文化锚点；城市优先（精确匹配），其次语言级默认。"""
     key = _normalize_city_key(city)
+    meta = None
     if key in _CITY_LOCALE:
-        return dict(_CITY_LOCALE[key])
-    # 模糊匹配：子串
-    lower = key.lower()
-    for cname, meta in _CITY_LOCALE.items():
-        if lower and (lower in cname.lower() or cname.lower() in lower):
-            return dict(meta)
-    lk = (lang or infer_language_from_city(city) or "zh").split("-")[0].lower()
-    base = dict(_LANG_MAINSTREAM.get(lk, _LANG_MAINSTREAM["zh"]))
-    base["lang"] = lk
-    return base
+        meta = dict(_CITY_LOCALE[key])
+    else:
+        lower = key.lower()
+        # 仅长名允许包含匹配，避免短串误绑
+        if len(lower) >= 5:
+            for cname, m in _CITY_LOCALE.items():
+                cl = cname.lower()
+                if len(cl) >= 5 and (lower == cl or lower in cl or cl in lower):
+                    meta = dict(m)
+                    break
+    if meta is None:
+        lk = (lang or infer_language_from_city(city) or "zh").split("-")[0].lower()
+        meta = dict(_LANG_MAINSTREAM.get(lk, _LANG_MAINSTREAM["zh"]))
+        meta["lang"] = lk
+    return _enrich_city_locale(key, meta)
 
 
 def get_cultural_context_for_city(city: str, lang: str | None = None) -> str:
@@ -341,9 +573,11 @@ def get_cultural_context_for_city(city: str, lang: str | None = None) -> str:
         f"- 主流语言：{locale.get('language', '')}\n"
         f"- 主流意识形态与关系观：{locale.get('ideology', '')}\n"
         f"- 日常生活环境：{locale.get('everyday', '')}\n"
+        f"- 国家/地区码：{locale.get('country', '')}\n"
         f"- 要求：life_story 的成长环境必须能支撑 cultural_values；"
         f"cultural_values 必须写清「家庭/学校/阶层经历 → 当前城市生活 → 对权威/自由/集体/家庭/金钱/亲密关系的态度」因果链；"
-        f"默认贴合当地主流；若有非主流立场，须用成长经历解释，且仍用当地主流语言表达。"
+        f"默认贴合当地主流；若有非主流立场，须用成长经历解释，且仍用当地主流语言表达；"
+        f"daily_routine / background 须出现与「{city or '本市'}」相关的具体通勤/饮食/社交场合，禁止把同语种其他城市的套话原样照搬。"
     )
     return f"{base}\n{city_block}"
 
@@ -556,21 +790,8 @@ def get_random_names(lang: str, gender: str, count: int = 5) -> list:
     return random.sample(pool, count)
 
 
-def get_cities(lang: str) -> list:
-    """返回对应语言的典型城市列表"""
-    return CITIES_DB.get(lang, CITIES_DB["zh"])
-
-
-# ===== 性格标签库（按语言） =====
-PERSONALITIES_DB = {
-    "zh": ["温柔", "可爱", "活泼", "阳光", "成熟", "腹黑", "冷静", "酷", "文艺", "元气", "傲娇", "天然呆", "毒舌", "御姐", "治愈", "神秘", "热情", "直率", "内敛", "细腻", "理性", "感性", "幽默", "慵懒", "独立", "黏人", "乖巧", "叛逆", "优雅", "随性"],
-    "en": ["warm", "cute", "energetic", "sunny", "mature", "mysterious", "calm", "cool", "artsy", "lively", "tsundere", "airheaded", "sarcastic", "queenly", "healing", "passionate", "straightforward", "reserved", "delicate", "rational", "emotional", "humorous", "lazy", "independent", "clingy", "obedient", "rebellious", "elegant", "casual", "bold"],
-    "ja": ["温柔", "可愛い", "活発", "元気", "成熟", "腹黒", "冷静", "クール", "文芸的", "元気いっぱい", "ツンデレ", "天然", "毒舌", "お姉さん系", "癒し系", "情熱的", "素直", "内向的", "繊細", "理性的", "感性的", "ユーモラス", "のんびり", "独立", "甘えん坊", "おとなしい", "反抗的", "優雅", "気まま", "大胆"],
-    "ko": ["다정", "귀여움", "활발", "밝음", "성숙", "츤데레", "침착", "쿨", "예술적", "생기넘침", "츤데레", "천연", "독설", "누나형", "힐링", "열정적", "솔직", "내향적", "섬세", "이성적", "감성적", "유머러스", "느긋", "독립적", "애교만점", "얌전", "반항적", "우아", "자유로움", "대담"],
-    "pt": ["carinhoso", "fofo", "energético", "alegre", "maduro", "misterioso", "calmo", "descolado", "artístico", "vibrante", "tsundere", "distraído", "sarcástico", "dominante", "acolhedor", "apaixonado", "direto", "reservado", "delicado", "racional", "emotivo", "humorístico", "preguiçoso", "independente", "apegado", "obediente", "rebelde", "elegante", "casual", "ousado"],
-    "es": ["cariñoso", "adorable", "enérgico", "soleado", "maduro", "misterioso", "calmado", "genial", "artístico", "animado", "tsundere", "distraído", "sarcástico", "dominante", "sanador", "apasionado", "directo", "reservado", "delicado", "racional", "emotivo", "humorístico", "perezoso", "independiente", "apegado", "obediente", "rebelde", "elegante", "casual", "atrevido"],
-    "id": ["lembut", "imut", "ceria", "cerah", "dewasa", "misterius", "tenang", "keren", "artistik", "enerjik", "tsundere", "polos", "sinis", "kakak-perempuan", "penyembuh", "penuh gairah", "blak-blakan", "tertutup", "halus", "rasional", "emosional", "lucu", "santai", "mandiri", "manja", "penurut", "nakal", "anggun", "santai", "berani"],
-}
+# ===== 性格标签库（按语言；权威定义见 personality_catalog） =====
+PERSONALITIES_DB = {lang: get_personality_labels_db(lang) for lang in ("zh", "en", "ja", "ko", "pt", "es", "id")}
 
 
 # ===== MBTI 列表 =====
@@ -593,13 +814,9 @@ SEXUAL_ORIENTATIONS = [
 ]
 
 
-# ===== 批量生成辅助函数 =====
-def get_random_personalities(lang: str, count: int = 3) -> list:
-    """返回随机性格标签列表"""
-    import random
-    pool = PERSONALITIES_DB.get(lang, PERSONALITIES_DB["zh"])
-    count = max(2, min(count, len(pool)))
-    return random.sample(pool, count)
+def get_random_personalities(lang: str, count: int = 3, gender: str = None) -> list:
+    """加权抽样性格标签（当地文案）；兼容旧调用。"""
+    return sample_personality_labels(lang=lang, count=count, gender=gender)
 
 
 def get_random_sexual_orientation() -> str:
@@ -616,48 +833,113 @@ def get_random_mbti() -> str:
     return random.choice(MBTI_LIST)
 
 
-def build_batch_profiles(lang: str, count: int, gender: str = None, sexual_orientation: str = None) -> list:
-    """批量生成基础属性列表，返回字典列表（含 name, gender, age, city, personality, mbti, sexual_orientation）
+def get_cities(lang: str, region_key: str | None = None, country: str | None = None) -> list:
+    """返回城市列表；可按 region_key / country 过滤。"""
+    lang = (lang or "zh").split("-")[0]
+    if region_key or country:
+        return get_cities_for_region(lang, region_key=region_key, country=country)
+    return list(CITIES_DB.get(lang, CITIES_DB["zh"]))
 
-    Args:
-        lang: 语言/文化背景
-        count: 生成数量
-        gender: 指定性别（"男" 或 "女"），None 则随机
-        sexual_orientation: 指定性取向，None 则随机
-    """
+
+def get_regions(lang: str, ui_lang: str | None = None) -> list:
+    """返回国家/地区 → 城市 树。"""
+    return list_regions(lang, ui_lang=ui_lang or lang)
+
+
+def build_random_profile(
+    lang: str,
+    gender: str = None,
+    sexual_orientation: str = None,
+    region_key: str = None,
+    country: str = None,
+    city: str = None,
+) -> dict:
+    """单条真随机档案（创建页 autofill / API）。"""
+    profiles = build_batch_profiles(
+        lang,
+        1,
+        gender=gender,
+        sexual_orientation=sexual_orientation,
+        region_key=region_key,
+        country=country,
+    )
+    profile = profiles[0]
+    if city and str(city).strip():
+        from services.region_catalog import find_region_for_city, normalize_city_query
+        locked = normalize_city_query(str(city).strip())
+        profile["city"] = locked
+        region = find_region_for_city(locked, lang) or find_region_for_city(locked) or {}
+        if region:
+            profile["country"] = region.get("country") or profile.get("country") or ""
+            profile["region_key"] = region.get("key") or profile.get("region_key") or ""
+            profile["region_label"] = region.get("label") or profile.get("region_label") or ""
+            if region.get("lang"):
+                # 锁定城市时同步文化圈语言，避免简介偏错语种
+                pass
+    return profile
+
+
+def build_batch_profiles(
+    lang: str,
+    count: int,
+    gender: str = None,
+    sexual_orientation: str = None,
+    region_key: str = None,
+    country: str = None,
+) -> list:
+    """批量生成基础属性（含 country/region + 人设维度轴）。城市尽量无放回。"""
     import random
+    lang = (lang or "zh").split("-")[0]
     names_db = NAMES_DB.get(lang, NAMES_DB["zh"])
-    cities_db = CITIES_DB.get(lang, CITIES_DB["zh"])
-    personalities_db = PERSONALITIES_DB.get(lang, PERSONALITIES_DB["zh"])
+    cities_db = get_cities(lang, region_key=region_key, country=country)
+    if not cities_db:
+        cities_db = list(CITIES_DB.get(lang, CITIES_DB["zh"]))
 
     used_names = set()
+    city_bag = cities_db[:]
+    random.shuffle(city_bag)
     profiles = []
 
-    for _ in range(count):
+    for i in range(count):
         g = gender if gender in ("男", "女") else random.choice(["男", "女"])
+        if gender in ("male", "female", "男", "女"):
+            g = "男" if gender in ("男", "male") else "女" if gender in ("女", "female") else g
         name_pool = names_db.get("male" if g == "男" else "female", [])
-        # 避免重名
         available = [n for n in name_pool if n not in used_names]
         if not available:
             available = name_pool
-        name = random.choice(available)
+        name = random.choice(available) if available else f"Agent{i+1}"
         used_names.add(name)
 
-        city = random.choice(cities_db)
+        if not city_bag:
+            city_bag = cities_db[:]
+            random.shuffle(city_bag)
+        city = city_bag.pop()
+        region = find_region_for_city(city, lang) or {}
+
         age = random.randint(18, 35)
-        personality_tags = random.sample(personalities_db, k=min(3, len(personalities_db)))
-        personality = "、".join(personality_tags) if lang == "zh" else ", ".join(personality_tags)
+        n_tags = random.randint(2, 4)
+        personality_tags = sample_personality_labels(lang=lang, count=n_tags, gender=g)
+        personality = join_personality_labels(personality_tags, lang)
         mbti = random.choice(MBTI_LIST)
         so = sexual_orientation if sexual_orientation else get_random_sexual_orientation()
+        axes = sample_persona_axes(lang)
 
         profiles.append({
             "name": name,
             "gender": g,
             "age": age,
             "city": city,
+            "country": region.get("country") or "",
+            "region_key": region.get("key") or "",
+            "region_label": region.get("label") or "",
             "personality": personality,
+            "personality_tags": personality_tags,
             "mbti": mbti,
             "sexual_orientation": so,
+            "persona_axes": axes.get("keys") or {},
+            "persona_axes_labels": axes.get("labels") or {},
+            "persona_axes_summary": axes.get("summary") or "",
         })
 
     return profiles
@@ -669,18 +951,20 @@ def get_cultural_knowledge_entries() -> list:
 
 
 def infer_language_from_city(city: str) -> str:
-    """根据城市名称推断对应语言，与前端 companionLang.ts 和 CITIES_DB 保持一致。
-    用于确保机器人资料的 language 与地区信息一致。
-    """
+    """根据城市名称推断对应语言；优先精确匹配，避免短名子串误判。"""
     if not city or not isinstance(city, str):
         return "zh"
-    city_lower = city.strip().lower()
+    region = find_region_for_city(city)
+    if region and region.get("lang"):
+        return region["lang"]
+    city_s = city.strip()
+    city_lower = city_s.lower()
+    # 精确匹配 CITIES_DB
     for lang, cities in CITIES_DB.items():
         for c in cities:
-            c_lower = c.lower()
-            if city_lower in c_lower or c_lower in city_lower or any(word in city_lower for word in [c_lower.split()[0] if ' ' in c else c_lower]):
+            if city_s == c or city_lower == c.lower():
                 return lang
-    # 默认中文地区
-    if any(ch in city_lower for ch in ["北京", "上海", "成都", "广州", "深圳", "杭州", "武汉", "西安", "南京", "重庆"]):
+    zh_hint = ("北京", "上海", "成都", "广州", "深圳", "杭州", "武汉", "西安", "南京", "重庆", "天津", "苏州", "长沙", "香港", "台北")
+    if any(ch in city_s for ch in zh_hint):
         return "zh"
     return "zh"

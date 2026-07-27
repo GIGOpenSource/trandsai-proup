@@ -122,8 +122,29 @@ async def api_add_comment(
 
 
 @router.post("/api/moments/{moment_id}/regenerate-image")
-async def api_regenerate_moment_image(moment_id: int):
-    """根据朋友圈文案重新生成配图"""
+async def api_regenerate_moment_image(
+    moment_id: int,
+    authorization: Optional[str] = Header(None),
+    x_token: Optional[str] = Header(None, alias="x-token"),
+):
+    """根据朋友圈文案重新生成配图（需管理员或登录用户）"""
+    admin_ok = False
+    if authorization and authorization.startswith("Bearer "):
+        try:
+            from api.auth import verify_token
+            admin_ok = bool(verify_token(authorization[7:].strip()))
+        except Exception:
+            admin_ok = False
+    user_ok = False
+    if not admin_ok and x_token:
+        try:
+            from api.auth import verify_user_token
+            user_ok = bool(verify_user_token(x_token))
+        except Exception:
+            user_ok = False
+    if not admin_ok and not user_ok:
+        raise HTTPException(status_code=401, detail="未授权")
+
     new_url = regenerate_moment_image(moment_id)
     if not new_url:
         raise HTTPException(status_code=404, detail="朋友圈不存在或无文案")

@@ -9,5 +9,5 @@ RUN pip install --no-cache-dir langchain-google-genai
 # 暴露端口
 EXPOSE 8000
 
-# 启动命令
+# 启动命
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]

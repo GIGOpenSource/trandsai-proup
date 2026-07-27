@@ -29,6 +29,16 @@ from services.culture_data import infer_language_from_city
 logger = logging.getLogger(__name__)
 
 
+def _normalize_gender(value) -> str:
+    """统一性别为 男/女；兼容 male/female。"""
+    g = str(value or "").strip().lower()
+    if g in ("男", "male", "m", "man"):
+        return "男"
+    if g in ("女", "female", "f", "woman"):
+        return "女"
+    return "女"
+
+
 def _batch_user_companion_states(user_id: int, companion_ids: List[str]) -> Dict[str, dict]:
     """Batch load per-user affection/turns for list API (S-10)."""
     if not companion_ids:
@@ -65,20 +75,21 @@ def _batch_user_companion_states(user_id: int, companion_ids: List[str]) -> Dict
         return user_map
 
 
-def _batch_last_messages(companion_ids: List[str]) -> Dict[str, dict]:
-    """一次查询获取多个 companion 的最后一条消息。"""
+def _batch_last_messages(
+    companion_ids: List[str],
+    user_id: Optional[int] = None,
+) -> Dict[str, dict]:
+    """一次查询获取多个 companion 的最后一条消息（有 user_id 时按用户隔离）。"""
     if not companion_ids:
         return {}
     with get_db() as db:
-        subq = (
-            db.query(
-                ShortTermMessageORM.companion_id,
-                func.max(ShortTermMessageORM.id).label("max_id"),
-            )
-            .filter(ShortTermMessageORM.companion_id.in_(companion_ids))
-            .group_by(ShortTermMessageORM.companion_id)
-            .subquery()
-        )
+        q = db.query(
+            ShortTermMessageORM.companion_id,
+            func.max(ShortTermMessageORM.id).label("max_id"),
+        ).filter(ShortTermMessageORM.companion_id.in_(companion_ids))
+        if user_id is not None:
+            q = q.filter(ShortTermMessageORM.user_id == user_id)
+        subq = q.group_by(ShortTermMessageORM.companion_id).subquery()
         rows = (
             db.query(ShortTermMessageORM)
             .join(subq, ShortTermMessageORM.id == subq.c.max_id)
@@ -132,7 +143,7 @@ class CompanionProfile(BaseModel):
     name: str = Field(..., min_length=1, max_length=20)
     age: int = Field(..., ge=18, le=35)
     gender: str = Field(default="女", pattern=r"^(男|女)$")
-    city: str = Field(..., min_length=1, max_length=20)
+    city: str = Field(..., min_length=1, max_length=64)
     personality: str = Field(..., min_length=5, max_length=500)
     background: str = Field(..., min_length=5, max_length=1000)
     speech_style: str = Field(..., min_length=5, max_length=500)
@@ -150,12 +161,25 @@ class CompanionProfile(BaseModel):
     avatar_url: str = Field(default="", max_length=500)
     created_by: str = Field(default="", max_length=64)
     language: str = Field(default="zh", max_length=10)
+    # 人设维度轴 / 国家地区（JSON 字符串或短文本，便于复盘同 MBTI 差异）
+    persona_axes: str = Field(default="", max_length=800)
+    country: str = Field(default="", max_length=8)
+    region_key: str = Field(default="", max_length=32)
     created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 
 def clamp_companion_profile_dict(data: dict) -> dict:
     """按 CompanionProfile 各字段的 MaxLen 截断字符串，避免 LLM/导入数据超长导致校验失败。"""
+    import json
     out = dict(data)
+    if "gender" in out:
+        out["gender"] = _normalize_gender(out.get("gender"))
+    # persona_axes 允许 dict，入库前序列化为 JSON 字符串
+    axes = out.get("persona_axes")
+    if isinstance(axes, dict):
+        out["persona_axes"] = json.dumps(axes, ensure_ascii=False)
+    elif axes is None:
+        out["persona_axes"] = ""
     for name, finfo in CompanionProfile.model_fields.items():
         if name not in out:
             continue
@@ -345,6 +369,9 @@ class CompanionManager:
                             avatar_url=row.avatar_url or "",
                             created_by=row.created_by or "",
                             language=row.language or "zh",
+                            persona_axes=getattr(row, "persona_axes", None) or "",
+                            country=getattr(row, "country", None) or "",
+                            region_key=getattr(row, "region_key", None) or "",
                             created_at=row.created_at.isoformat() if row.created_at else datetime.now(timezone.utc).isoformat(),
                         )
                         s = state_map.get(row.id)
@@ -367,20 +394,12 @@ class CompanionManager:
     def create(self, profile_data: dict, chat_history: list = None) -> Companion:
         profile = CompanionProfile(**clamp_companion_profile_dict(profile_data))
 
-        # 强制确保 language 与地区（city）信息一致
-        if not getattr(profile, 'language', None) or profile.language == "zh":
+        # 语言与城市：仅在未显式指定 language 时按城市推断；显式指定则尊重（含 zh）
+        explicit_lang = bool((profile_data.get("language") or "").strip())
+        if not explicit_lang:
             profile.language = infer_language_from_city(profile.city)
-        elif profile.language != infer_language_from_city(profile.city):
-            # 如果不一致，强制修改为地区匹配的语言
-            inferred = infer_language_from_city(profile.city)
-            logger.info(
-                "[CompanionManager] Forcing language for %s from %s to %s based on city %s",
-                profile.name,
-                profile.language,
-                inferred,
-                profile.city,
-            )
-            profile.language = inferred
+        elif not (profile.language or "").strip():
+            profile.language = infer_language_from_city(profile.city)
 
         # 内存中去重（名称+城市）
         for c in self._companions.values():
@@ -397,12 +416,15 @@ class CompanionManager:
                 # 如果内存中没有但 DB 中有，重新加载到内存
                 if existing.id not in self._companions:
                     self._load_all()
-                return self._companions.get(existing.id) or Companion(
+                hit = self._companions.get(existing.id)
+                if hit:
+                    return hit
+                return Companion(
                     CompanionProfile(
                         id=existing.id,
                         name=existing.name,
                         age=existing.age or 18,
-                        gender=existing.gender or "女",
+                        gender=_normalize_gender(existing.gender or "女"),
                         city=existing.city or "未知",
                         personality=existing.personality or "温柔体贴",
                         background=existing.background or "",
@@ -421,6 +443,9 @@ class CompanionManager:
                         avatar_url=existing.avatar_url or "",
                         created_by=existing.created_by or "",
                         language=existing.language or "zh",
+                        persona_axes=getattr(existing, "persona_axes", None) or "",
+                        country=getattr(existing, "country", None) or "",
+                        region_key=getattr(existing, "region_key", None) or "",
                         created_at=existing.created_at.isoformat() if existing.created_at else datetime.now(timezone.utc).isoformat(),
                     ),
                     self.memory_root,
@@ -449,6 +474,9 @@ class CompanionManager:
                 avatar_url=profile.avatar_url,
                 created_by=profile.created_by or "",
                 language=profile.language or "zh",
+                persona_axes=getattr(profile, "persona_axes", "") or "",
+                country=getattr(profile, "country", "") or "",
+                region_key=getattr(profile, "region_key", "") or "",
                 created_at=datetime.fromisoformat(profile.created_at) if profile.created_at else datetime.now(timezone.utc),
             ))
             db.add(CompanionStateORM(companion_id=profile.id))
@@ -480,38 +508,23 @@ class CompanionManager:
         return self._companions.get(companion_id)
 
     def list_all(self, user_id: Optional[int] = None) -> List[Dict]:
-        """获取 companions 列表。
-        必须提供 user_id，只返回该用户拥有的 companions（created_by 匹配）。
+        """返回全部智能体（业务：可见别人创建的智能体）。
+
+        - 传入 user_id：附带该用户亲密度 / 末条消息预览
+        - 不传 user_id：Admin 全量列表（无用户态）
         """
-        if user_id is None:
-            return []
-
         result = []
-        user_id_str = str(user_id)
-
-        # 获取用户信息用于 username/nickname 匹配
-        username = ""
-        nickname = ""
-        with get_db() as db:
-            user = db.query(UserORM).filter(UserORM.id == user_id).first()
-            if user:
-                username = (user.username or "").strip()
-                nickname = (user.nickname or "").strip()
-
-        matched: List[tuple] = []
-        for c in self._companions.values():
-            created_by = (c.profile.created_by or "").strip()
-
-            if created_by != user_id_str and created_by != username and created_by != nickname:
-                continue
-
-            matched.append((c, c.profile.id))
-
+        matched: List[tuple] = [(c, c.profile.id) for c in self._companions.values()]
         companion_ids = [cid for _, cid in matched]
-        last_msgs = _batch_last_messages(companion_ids)
-        state_map = _batch_user_companion_states(user_id, companion_ids)
+        last_msgs = _batch_last_messages(companion_ids, user_id=user_id)
+        state_map = (
+            _batch_user_companion_states(user_id, companion_ids) if user_id is not None else {}
+        )
         for c, cid in matched:
-            item = c.to_dict(user_id=user_id, user_state=state_map.get(cid))
+            item = c.to_dict(
+                user_id=user_id,
+                user_state=state_map.get(cid) if user_id is not None else None,
+            )
             last = last_msgs.get(cid)
             if last:
                 item["last_message"] = last["content"]
@@ -527,17 +540,40 @@ class CompanionManager:
         if not companion:
             return None
 
-        # 更新内存中的 profile（添加 mbti 支持）
-        updatable = {"name", "age", "gender", "city", "personality", "background", "speech_style", "hobbies", "values", "fears", "love_view", "daily_routine", "favorite_things", "mbti", "sexual_orientation", "life_story", "cultural_values", "gender_perspective", "avatar_url", "created_by", "language"}
+        # 更新内存中的 profile（含 persona_axes / country / region_key）
+        updatable = {
+            "name", "age", "gender", "city", "personality", "background", "speech_style",
+            "hobbies", "values", "fears", "love_view", "daily_routine", "favorite_things",
+            "mbti", "sexual_orientation", "life_story", "cultural_values", "gender_perspective",
+            "avatar_url", "created_by", "language", "persona_axes", "country", "region_key",
+        }
         for key in updatable:
             if key in data:
-                setattr(companion.profile, key, data[key])
+                val = data[key]
+                if key == "gender":
+                    val = _normalize_gender(val)
+                if key == "persona_axes" and isinstance(val, dict):
+                    import json as _json
+                    val = _json.dumps(val, ensure_ascii=False)
+                setattr(companion.profile, key, val)
 
-        # 如果更新了 city 或 language，确保一致性
+        # 如果更新了 city 或 language，确保一致性（不强改用户显式指定的非推断语言）
         if "city" in data or "language" in data:
             city = getattr(companion.profile, 'city', '')
+            lang = getattr(companion.profile, 'language', '') or ''
             inferred = infer_language_from_city(city)
-            if getattr(companion.profile, 'language', 'zh') != inferred:
+            # 仅在未设置 language，或 language 与城市一致时才强制；显式 language 已写且 city 未变则保留
+            if "language" not in data:
+                if not lang or lang != inferred:
+                    companion.profile.language = inferred
+                    logger.info(
+                        "[CompanionManager] Updated language for %s to %s based on city %s",
+                        companion.profile.name,
+                        inferred,
+                        city,
+                    )
+            elif "city" in data and lang != inferred:
+                # 改了城市：以城市推断为准
                 companion.profile.language = inferred
                 logger.info(
                     "[CompanionManager] Updated language for %s to %s based on city %s",
@@ -546,13 +582,26 @@ class CompanionManager:
                     city,
                 )
 
-        # 同步更新 PostgreSQL
+        # 同步更新 PostgreSQL（含内存中可能已推断的 language / 规范化字段）
         with get_db() as db:
             row = db.query(CompanionORM).filter(CompanionORM.id == companion_id).first()
             if row:
                 for key in updatable:
-                    if key in data:
-                        setattr(row, key, data[key])
+                    if key in data or key in ("language", "persona_axes", "country", "region_key", "gender"):
+                        if key not in data and key == "language":
+                            setattr(row, key, getattr(companion.profile, key, None))
+                            continue
+                        if key not in data:
+                            continue
+                        val = data[key]
+                        if key == "gender":
+                            val = _normalize_gender(val)
+                        if key == "persona_axes" and isinstance(val, dict):
+                            import json as _json
+                            val = _json.dumps(val, ensure_ascii=False)
+                        setattr(row, key, val)
+                # 确保 city 变更后的 language 落库
+                row.language = getattr(companion.profile, "language", row.language)
 
         # 处理 system_prompt_* 和 agent 配置，保存到独立表（修复前端保存不生效问题）
         prompt_data = {}
